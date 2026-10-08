@@ -2309,6 +2309,7 @@ local function unload()
     if getgenv().FIU_MAIN and getgenv().FIU_MAIN.unload == unload then getgenv().FIU_MAIN = nil end -- not a newer copy's export
     running = false
     pcall(RunService.Set3dRenderingEnabled, RunService, true) -- never leave the world black after unload
+    if HOOK.TR then pcall(HOOK.TR.restore) end -- traffic back, collisions back
     for _, c in ipairs(conns) do pcall(c.Disconnect, c) end
     for _, h in ipairs({ { CONFIRM, "Confirmation", HOOK.fn, HOOK.orig }, { HOOK.store, "StoreConfirmation", HOOK.storeFn, HOOK.sorig } }) do
         if h[1] and h[4] then
@@ -4189,12 +4190,116 @@ task.spawn(function()
     end
 end)
 end
+do
+-- ============================== traffic ==============================
+-- Client side only: hidden traffic is parented to nil on this client (the server keeps driving it), collisions are
+-- turned off on this client's copy. Both are ON at every load, whatever a saved config says. Traffic is found by name
+-- (Traffic / NPC / AI car folders) anywhere 3 levels into workspace, never workspace.Vehicles (players' + junk cars).
+HOOK.TR = { hide = true, noCol = true, hidden = {}, cols = {}, found = {}, status = "looking for traffic..." }
+local TR = HOOK.TR
+local PATS = { "traffic", "npccar", "npcvehicle", "npcveh", "aicar", "aivehicle", "civiliancar", "botcar" }
+local function named(n)
+    n = n:lower():gsub("[%s_%-]", "")
+    for _, pat in ipairs(PATS) do if n:find(pat, 1, true) then return true end end
+    return false
+end
+function TR.scan()
+    local out = {}
+    local function walk(inst, depth)
+        for _, c in ipairs(inst:GetChildren()) do
+            if c ~= Vehicles and (c:IsA("Folder") or c:IsA("Model")) and not Players:GetPlayerFromCharacter(c) then
+                if named(c.Name) then out[#out + 1] = c
+                elseif depth < 3 then walk(c, depth + 1) end
+            end
+        end
+    end
+    walk(workspace, 1)
+    return out
+end
+function TR.setCollide(container, off)
+    for _, d in ipairs(container:GetDescendants()) do
+        if d:IsA("BasePart") then
+            if off then
+                if TR.cols[d] == nil and d.CanCollide then TR.cols[d] = true end
+                if d.CanCollide then d.CanCollide = false end
+            elseif TR.cols[d] then
+                d.CanCollide = true; TR.cols[d] = nil
+            end
+        end
+    end
+end
+function TR.restore()
+    for inst, parent in pairs(TR.hidden) do if parent and parent.Parent ~= nil then pcall(function() inst.Parent = parent end) end end
+    table.clear(TR.hidden)
+    for part in pairs(TR.cols) do if part.Parent then pcall(function() part.CanCollide = true end) end end
+    table.clear(TR.cols)
+end
+function TR.tick()
+    if not TR.hide then -- bring back what we hid
+        for inst, parent in pairs(TR.hidden) do if parent and parent.Parent ~= nil then pcall(function() inst.Parent = parent end) end end
+        table.clear(TR.hidden)
+    end
+    local found = TR.scan()
+    TR.found = found
+    local n = 0
+    for _, c in ipairs(found) do
+        n += 1
+        if TR.hide then
+            TR.hidden[c] = c.Parent
+            c.Parent = nil
+        else
+            TR.setCollide(c, TR.noCol)
+        end
+    end
+    local hiddenN = 0 for _ in pairs(TR.hidden) do hiddenN += 1 end
+    if n == 0 and hiddenN == 0 then
+        TR.status = "No traffic found yet. If cars still drive around, press the button below and paste the list to whoever edits the script."
+    elseif TR.hide then
+        TR.status = ("Traffic hidden (%d group%s)"):format(hiddenN, hiddenN == 1 and "" or "s")
+    else
+        local names = {}
+        for i, c in ipairs(found) do if i <= 3 then names[#names + 1] = c.Name end end
+        TR.status = ("Traffic found: %s%s · collisions %s"):format(table.concat(names, ", "), #found > 3 and ", ..." or "", TR.noCol and "off" or "on")
+    end
+end
+task.spawn(function()
+    while running do guard("traffic", TR.tick); task.wait(3) end
+end)
+
+local World = Tabs.Settings:AddLeftGroupbox("Traffic", "car-front")
+World:AddToggle("FIU_NoTraffic", { Text = "Disable traffic", Default = true,
+    Tooltip = "Removes the AI traffic cars on your screen (only for you). On every time the script loads.",
+    Callback = function(v) TR.hide = v; task.spawn(guard, "traffic", TR.tick) end })
+World:AddToggle("FIU_NoTrafficCol", { Text = "Disable traffic collisions", Default = true,
+    Tooltip = "Traffic stays visible but your car drives through it. On every time the script loads.",
+    Callback = function(v)
+        TR.noCol = v
+        if not v then for _, c in ipairs(TR.found) do TR.setCollide(c, false) end end
+        task.spawn(guard, "traffic", TR.tick)
+    end })
+local trLabel = World:AddLabel("-", true)
+World:AddButton({ Text = "Copy workspace folder names", Tooltip = "For finding where the game keeps its traffic", Func = function()
+    local lines = {}
+    for _, c in ipairs(workspace:GetChildren()) do
+        if not c:IsA("BasePart") and not Players:GetPlayerFromCharacter(c) then
+            local sub = {}
+            for i, k in ipairs(c:GetChildren()) do if i <= 12 and not k:IsA("BasePart") then sub[#sub + 1] = k.Name end end
+            lines[#lines + 1] = ("%s (%s, %d): %s"):format(c.Name, c.ClassName, #c:GetChildren(), table.concat(sub, ", "))
+        end
+    end
+    local text = table.concat(lines, "\n")
+    if setclipboard then pcall(setclipboard, text); notify("Copied: paste it in your chat") else log(text) end
+end })
+task.spawn(function()
+    while running do pcall(trLabel.SetText, trLabel, TR.status); task.wait(1) end
+end)
+end
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 -- a config is the WHOLE menu: every toggle (distance farm, auto hop, gold contract included), slider, dropdown, input
 -- and color is saved and loaded. Nothing is excluded (user, 2026-10-01: "the configs will save the configuration of the menu").
-SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup" })
+SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
 -- CruelHub look: near-black with a crimson accent (still switchable under Settings > Themes)
