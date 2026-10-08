@@ -4764,29 +4764,9 @@ do
         return { mid - axis * half, mid + axis * half }, top
     end
 
-    -- private road: a 6000-stud road only THIS client has, 150 studs above the highway (no turns every ~1000 studs, no
-    -- traffic). The server never sees it, so whether the game counts the distance is what the watchdog finds out:
-    -- if nothing is counted for 2 min, the farm goes back to the Highway on its own.
-    farm.PRIV = "Private road (experimental)"
-    function farm.privateRoute()
-        local a, b = Vector3.new(-1076.83, 1.02, 2612.93), Vector3.new(-843.24, 1.02, 1598.84) -- highway ends
-        local axis = Vector3.new(b.X - a.X, 0, b.Z - a.Z).Unit
-        local mid = HWY_AT + Vector3.new(0, 150, 0)
-        local road = HOOK.road
-        if not (road and road.Parent) then
-            road = Instance.new("Part")
-            road.Name, road.Anchored, road.CanCollide = "FIU_PrivateRoad", true, true
-            road.Size = Vector3.new(60, 2, 6000)
-            road.Material, road.Color = Enum.Material.Asphalt, Color3.fromRGB(45, 45, 48)
-            road.CFrame = CFrame.lookAt(mid, mid + axis)
-            road.Parent = workspace
-            HOOK.road = road
-        end
-        local top = road.Position.Y + road.Size.Y / 2
-        local c = Vector3.new(road.Position.X, top, road.Position.Z)
-        return { c - axis * 2900, c + axis * 2900 }, top
-    end
-
+    -- (a client-only "private road" was tried 2026-10-08: the game only counts km while the wheels touch ground the
+    -- server knows about, so it counted ~nothing, and 6000 studs ran into the mountain. Removed.)
+    farm.PRIV = "Private road (experimental)" -- old saved configs: treated as Highway
     function farm.pending()
         if not (CFG.autoBuy or CFG.autoRepair or CFG.autoSell) then return false end
         for _, e in ipairs(entries()) do
@@ -4833,10 +4813,8 @@ do
         -- spawn on real ground: the server owns a fresh car's physics and doesn't have the private road, so a car spawned
         -- on it falls (2026-10-08). The private road is only used once you're seated and driving the car yourself.
         local spawnPts, spawnTop
-        if CFG.driveRoute == farm.PRIV then
-            pts, top = farm.privateRoute()
-            spawnPts, spawnTop = highwayRoute()
-        elseif CFG.driveRoute == "Highway" then
+        if CFG.driveRoute == farm.PRIV then CFG.driveRoute = "Highway" end
+        if CFG.driveRoute == "Highway" then
             pts, top = highwayRoute()
         else
             pts, top = roadRoute()
@@ -4901,15 +4879,8 @@ do
             end
             local km, _, owed = numbers()
             if km > lastKm + 0.001 then lastKm, lastKmAt = km, os.clock()
-            elseif (CFG.farmResume or CFG.driveRoute == farm.PRIV) and os.clock() - lastKmAt > 120 then
-                farm.status = "stuck: no distance counted for 2 min"; farm.retry = true
-                if CFG.driveRoute == farm.PRIV then
-                    CFG.driveRoute = "Highway"
-                    pcall(function() Library.Options.FIU_DriveRoute:SetValue("Highway") end)
-                    farm.retry = true; farm.status = "the game doesn't count the private road: back to the Highway"
-                    notify(farm.status); log("drive farm: " .. farm.status)
-                end
-                break
+            elseif CFG.farmResume and os.clock() - lastKmAt > 120 then
+                farm.status = "stuck: no distance counted for 2 min"; farm.retry = true; break
             end
             if not CFG.driveNoLimit and owed + CFG.driveExtra <= 0 then farm.status = ("done: drove %.2f km"):format(km - farm.startKm); notify("Distance farm done"); break end
             if farm.chosen and not farm.auto and farm.car ~= e then farm.yielded = true; farm.status = "switching car"; break end -- picked another car mid-run
@@ -5040,8 +5011,8 @@ do
             task.wait(1)
         end
     end)
-    FarmBox:AddDropdown("FIU_DriveRoute", { Text = "Route", Values = { "Highway", "City road", farm.PRIV }, Default = CFG.driveRoute,
-        Tooltip = "Highway: back and forth on the long straight stretch north of town. City road: the longest straight road in town. Private road: a 6000-stud road only you can see, 150 studs above the highway; if the game doesn't count it, the farm switches back to the Highway after 2 min.",
+    FarmBox:AddDropdown("FIU_DriveRoute", { Text = "Route", Values = { "Highway", "City road" }, Default = CFG.driveRoute == farm.PRIV and "Highway" or CFG.driveRoute,
+        Tooltip = "Highway: back and forth on the long straight stretch north of town. City road: the longest straight road in town.",
         Callback = set("driveRoute") })
     FarmBox:AddSlider("FIU_DriveSpeed", { Text = "Speed", Default = CFG.driveSpeed, Min = 20, Max = 210, Rounding = 0, Suffix = " studs/s",
         Tooltip = "About km/h on the speedometer. Measured 2026-10-02: 150 credited ~0.9-1.0 km/min, 210 only ~0.1-0.5 (the game stops counting most of it).",
