@@ -1900,12 +1900,16 @@ end
 
 -- ============================== server hop (was fiu_hop.lua) ==============================
 -- Hops public servers until every other player has fewer than N "Cars Sold" (fewer competitors for junk).
--- State in fiu_hop.json (shared with the old standalone hopper) so settings + visited servers survive teleports.
+-- State in fiu_hop_<UserId>.json (one per account) so settings + visited servers survive teleports.
 if getgenv().FIU_Hop_Unload then pcall(getgenv().FIU_Hop_Unload) end -- the standalone hopper would fight this one
 local TeleportService = game:GetService("TeleportService")
 local req = request or http_request or (syn and syn.request)
-local HOP_FILE, VISIT_TTL = "fiu_hop.json", 3600
-local HOP = readJSON(HOP_FILE, {})
+-- per account: with one shared fiu_hop.json, an account that still had Auto hop on wrote auto = true back over the one
+-- you had turned it off on, so it started hopping again after its next reload. First run: copy the old shared settings,
+-- but never inherit a hunt in progress (that was whichever account saved last).
+local HOP_FILE, VISIT_TTL = ("fiu_hop_%d.json"):format(LP.UserId), 3600
+local HOP = readJSON(HOP_FILE, nil)
+if not HOP then HOP = readJSON("fiu_hop.json", {}); HOP.auto = false; HOP.hops = 0 end
 for k, v in pairs({ auto = false, max = 50, over = 0, maxp = 8, hops = 0, visited = {}, hard = false, hardMax = 1500, gate = false, leaveOnFail = false, chatBlock = true, chatSpam = false, chatSpamN = 20,
     antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest" }) do if HOP[k] == nil then HOP[k] = v end end
 local function saveHop() writeJSON(HOP_FILE, HOP) end
@@ -1933,7 +1937,7 @@ if not ok then pcall(writefile, "FixItUp/reload_error.txt", os.date() .. " " .. 
 
 -- ============================== anti-mod ==============================
 -- Game group ".workspace" (12249805): regular players are Member (rank 1); every rank above is staff.
--- Settings live in fiu_hop.json so the watch is on the moment the script loads after a hop.
+-- Settings live in fiu_hop_<UserId>.json so the watch is on the moment the script loads after a hop.
 local STAFF = {
     group = 12249805,
     roles = { { "Tester", 2 }, { "Content Creator", 3 }, { "Analytics", 4 }, { "Contributor", 130 }, { "Developers / Anti-Cheat", 150 },
@@ -2293,6 +2297,7 @@ function STAFF.leave()
         return
     end
     lifeLog("rules broken: hopping")
+    notify("Server broke your rules: hopping (turn off 'Hop away when the server breaks the rules' to stop this)")
     if hopToggle then hopToggle:SetValue(true) else HOP.auto = true; saveHop(); task.spawn(hopRun) end
 end
 
@@ -4893,7 +4898,7 @@ do
 end
 
 do
--- Server hop tab (settings live in fiu_hop.json, not SaveManager, so they survive the teleport before autoload)
+-- Server hop tab (settings live in fiu_hop_<UserId>.json, not SaveManager, so they survive the teleport before autoload)
 local HopBox = Tabs.Hop:AddLeftGroupbox("Auto hop", "shuffle")
 HopBox:AddLabel("Hops to servers where the other players have sold few cars (less competition at the junkyard). Reloads this script after every hop.", true)
 hopToggle = HopBox:AddToggle("FIU_HopAuto", { Text = "Auto hop until match", Default = HOP.auto,
