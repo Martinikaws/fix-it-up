@@ -1575,6 +1575,17 @@ function HOOK.WH.spawn(tier, name, chance)
         } },
     })
 end
+-- km driven, cars sold, distance owed (owed > 0 = behind); nil until the Drive tab has loaded
+function HOOK.WH.drive()
+    if not HOOK.driveNumbers then return nil end
+    local ok, km, sold, owed = pcall(HOOK.driveNumbers)
+    if not ok then return nil end
+    return { km = km, sold = sold, owed = owed }
+end
+function HOOK.WH.owedText(owed)
+    owed = tonumber(owed) or 0
+    return owed > 0 and ("⚠️ owes %.2f km"):format(owed) or ("ahead %.2f km"):format(-owed)
+end
 function HOOK.WH.money(manual)
     local now, m = os.time(), myMoney()
     local fields = { { name = "Money", value = money(m), inline = true } }
@@ -1585,6 +1596,12 @@ function HOOK.WH.money(manual)
     end
     local held = 0 for _ in pairs(OWNED) do held += 1 end
     fields[#fields + 1] = { name = "Flip cars held", value = tostring(held), inline = true }
+    local dr = HOOK.WH.drive()
+    if dr then
+        fields[#fields + 1] = { name = "Km driven", value = ("%.2f km"):format(dr.km), inline = true }
+        fields[#fields + 1] = { name = "Cars sold", value = tostring(dr.sold), inline = true }
+        fields[#fields + 1] = { name = dr.owed > 0 and "You owe" or "Distance", value = dr.owed > 0 and ("%.2f km"):format(dr.owed) or ("ahead by %.2f km"):format(-dr.owed), inline = true }
+    end
     local ok = HOOK.WH.push({ embeds = { { title = manual and "Money (manual)" or "Money report", color = 0x2ecc71, fields = fields } } })
     if ok then HOOK.WH.lastMoney, HOOK.WH.lastAt = m, now; HOOK.WH.save() end
     return ok
@@ -1598,7 +1615,12 @@ function HOOK.WH.beat()
     pcall(function() if not isfolder(W.ACC) then makefolder(W.ACC) end end)
     local held = 0 for _ in pairs(OWNED) do held += 1 end
     writeJSON(("%s/%d.json"):format(W.ACC, LP.UserId),
-        { name = LP.Name, uid = LP.UserId, money = myMoney(), ts = os.time(), job = game.JobId, held = held })
+        (function()
+            local t = { name = LP.Name, uid = LP.UserId, money = myMoney(), ts = os.time(), job = game.JobId, held = held }
+            local dr = W.drive()
+            if dr then t.km, t.sold, t.owed = dr.km, dr.sold, dr.owed end
+            return t
+        end)())
 end
 function HOOK.WH.states()
     local out = {}
@@ -1632,6 +1654,7 @@ function HOOK.WH.moneyAll(manual)
     for _, st in pairs(states) do if now - (tonumber(st.ts) or 0) < 86400 then list[#list + 1] = st end end
     table.sort(list, function(a, b) return tostring(a.name):lower() < tostring(b.name):lower() end)
     local lines, total, totalD, live, anyD = {}, 0, 0, 0, false
+    local totSold, owing = 0, 0
     for _, st in ipairs(list) do
         local live1, m = now - (tonumber(st.ts) or 0) <= W.STALE, tonumber(st.money) or 0
         local prev = tonumber(last.by[tostring(st.uid)])
@@ -1641,9 +1664,16 @@ function HOOK.WH.moneyAll(manual)
         if d then totalD += d; anyD = true end
         lines[#lines + 1] = ("%s **%s**  %s%s%s"):format(live1 and "🟢" or "⚫", tostring(st.name), money(m),
             d and d ~= 0 and (" (%s%s)"):format(d >= 0 and "+" or "-", money(math.abs(d))) or "", live1 and "" or "  _offline_")
+        if st.km then
+            lines[#lines + 1] = ("   %.1f km · %d sold · %s"):format(tonumber(st.km) or 0, tonumber(st.sold) or 0, W.owedText(st.owed))
+            totSold += tonumber(st.sold) or 0
+            if (tonumber(st.owed) or 0) > 0 then owing += 1 end
+        end
         last.by[tostring(st.uid)] = m
     end
     local fields = { { name = "Total", value = money(total), inline = true } }
+    fields[#fields + 1] = { name = "Cars sold", value = tostring(totSold), inline = true }
+    if owing > 0 then fields[#fields + 1] = { name = "Owing distance", value = ("%d account%s"):format(owing, owing == 1 and "" or "s"), inline = true } end
     if anyD and last.at then
         local mins = math.max(1, (now - last.at) / 60)
         fields[#fields + 1] = { name = "Change", value = (totalD >= 0 and "+" or "-") .. money(math.abs(totalD)), inline = true }
@@ -4686,6 +4716,7 @@ do
         local spare = math.floor((km - sold * D.kmPerCar) / math.max(0.001, D.kmPerCar)) -- sales left before you owe
         return km, sold, owed, spare
     end
+    HOOK.driveNumbers = numbers -- for the webhook reports
 
     local farm = { on = false, status = "off", startKm = 0 }
     -- route: back and forth along the city's longest straight road (the traffic lanes run on a far-off highway)
