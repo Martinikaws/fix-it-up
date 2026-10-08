@@ -4539,6 +4539,19 @@ do
         return true
     end
 
+    -- "Auto pick": a car auto flip will never touch first: your favorites (locked), then cars the script didn't buy,
+    -- then a flip as the last resort (auto sell skips the car being farmed). Keeps the current one while it's still there.
+    function farm.autoPick()
+        if farm.autoCar and farm.autoCar.Parent == Garage then return farm.autoCar end
+        local best, bestRank
+        for _, e in ipairs(entries()) do
+            local rank = isFav(e) and 1 or (not OWNED[e.Name] and 2) or 3
+            if not bestRank or rank < bestRank or (rank == bestRank and e.Name < best.Name) then best, bestRank = e, rank end
+        end
+        farm.autoCar = best
+        return best
+    end
+
     local function farmRun()
         -- a car picked in the Drive tab that has gone (sold) stops the farm: never fall back to some other car
         if farm.chosen and not (farm.car and farm.car.Parent) then
@@ -4546,9 +4559,10 @@ do
             farm.on = false
             return
         end
-        local e = (farm.chosen and farm.car) or selectedCar -- the Drive tab's own pick, else the Garage tab's
+        local e = (farm.auto and farm.autoPick()) or (farm.chosen and farm.car) or selectedCar -- auto, the Drive tab's pick, else the Garage tab's
         CFG.farmCarGuid = e and e.Name or nil -- auto sell never sells the car being farmed
-        if not e then farm.status = "pick a car in the Garage tab first"; return end
+        if not e then farm.status = farm.auto and "auto pick: your garage is empty" or "pick a car in the Garage tab first"; farm.retry = farm.auto; return end
+        if farm.auto then farm.status = "auto picked " .. entryModel(e) end
         local pts, top, cycle
         if CFG.driveRoute == "Highway" then
             pts, top = highwayRoute()
@@ -4618,7 +4632,7 @@ do
                 farm.status = "stuck: no distance counted for 2 min"; farm.retry = true; break
             end
             if not CFG.driveNoLimit and owed + CFG.driveExtra <= 0 then farm.status = ("done: drove %.2f km"):format(km - farm.startKm); notify("Distance farm done"); break end
-            if farm.chosen and farm.car ~= e then farm.yielded = true; farm.status = "switching car"; break end -- picked another car mid-run
+            if farm.chosen and not farm.auto and farm.car ~= e then farm.yielded = true; farm.status = "switching car"; break end -- picked another car mid-run
             if manualPending then farm.yielded = true; farm.status = "paused for a button"; break end
             if STAFF.gated() then farm.yielded = true; farm.status = "blocked: " .. STAFF.gateMsg; break end
             if CFG.farmYield and os.clock() - (farm.lastCheck or 0) > 0.5 then
@@ -4709,14 +4723,16 @@ do
     FarmBox:AddToggle("FIU_DriveYield", { Text = "Pause for auto flips", Default = CFG.farmYield,
         Tooltip = "Steps out while Auto has a car to buy, repair or sell (sell timer up), then keeps driving. Needs the Auto toggles on.",
         Callback = set("farmYield") })
-    local PICK = "Garage tab pick"
-    local carDropF = FarmBox:AddDropdown("FIU_DriveCar", { Text = "Car", Values = { PICK }, Default = PICK,
-        Tooltip = "Which car to drive; \"Garage tab pick\" uses the car picked in the Garage tab",
+    local PICK, AUTO = "Garage tab pick", "Auto pick"
+    farm.auto = D.autoPick == true
+    local carDropF = FarmBox:AddDropdown("FIU_DriveCar", { Text = "Car", Values = { AUTO, PICK }, Default = farm.auto and AUTO or PICK,
+        Tooltip = "Which car to drive. Auto pick: a favorite first, then a car the script didn't buy, a flip car only if that's all you have. \"Garage tab pick\" uses the car picked in the Garage tab.",
         Callback = function(v)
             if farm.refreshing then return end -- the list being rebuilt isn't a new pick
-            farm.chosen = v ~= nil and v ~= PICK
+            farm.auto = v == AUTO; farm.autoCar = nil
+            farm.chosen = v ~= nil and v ~= PICK and v ~= AUTO
             farm.car = farm.chosen and carByLabel[v] or nil
-            D.car = farm.car and farm.car.Name or nil; saveD() -- remembered by car id (labels change when a car is locked)
+            D.car = farm.car and farm.car.Name or nil; D.autoPick = farm.auto; saveD() -- remembered by car id (labels change when a car is locked)
         end })
     task.spawn(function() -- keep the list in step with your garage, keeping the pick
         local lastKey = ""
@@ -4728,13 +4744,14 @@ do
             if key ~= lastKey then
                 lastKey = key
                 local keep = farm.car
-                if not keep and D.car and Garage:FindFirstChild(D.car) then -- the pick saved last session
+                if not keep and not farm.auto and D.car and Garage:FindFirstChild(D.car) then -- the pick saved last session
                     keep = Garage[D.car]; farm.chosen, farm.car = true, keep
                 end
                 table.insert(labels, 1, PICK)
+                table.insert(labels, 1, AUTO)
                 farm.refreshing = true
                 carDropF:SetValues(labels)
-                local keepLabel = PICK
+                local keepLabel = farm.auto and AUTO or PICK
                 for l, e2 in pairs(carByLabel) do if e2 == keep then keepLabel = l end end
                 carDropF:SetValue(keepLabel) -- a sold farm car shows "Garage tab pick" but the farm still stops (farm.chosen stays)
                 farm.refreshing = false
