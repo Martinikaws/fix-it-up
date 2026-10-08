@@ -2310,6 +2310,7 @@ local function unload()
     running = false
     pcall(RunService.Set3dRenderingEnabled, RunService, true) -- never leave the world black after unload
     if HOOK.TR then pcall(HOOK.TR.restore) end -- traffic back, collisions back
+    if HOOK.road then pcall(HOOK.road.Destroy, HOOK.road); HOOK.road = nil end
     for _, c in ipairs(conns) do pcall(c.Disconnect, c) end
     for _, h in ipairs({ { CONFIRM, "Confirmation", HOOK.fn, HOOK.orig }, { HOOK.store, "StoreConfirmation", HOOK.storeFn, HOOK.sorig } }) do
         if h[1] and h[4] then
@@ -4732,6 +4733,29 @@ do
         return { mid - axis * half, mid + axis * half }, top
     end
 
+    -- private road: a 6000-stud road only THIS client has, 150 studs above the highway (no turns every ~1000 studs, no
+    -- traffic). The server never sees it, so whether the game counts the distance is what the watchdog finds out:
+    -- if nothing is counted for 2 min, the farm goes back to the Highway on its own.
+    farm.PRIV = "Private road (experimental)"
+    function farm.privateRoute()
+        local a, b = Vector3.new(-1076.83, 1.02, 2612.93), Vector3.new(-843.24, 1.02, 1598.84) -- highway ends
+        local axis = Vector3.new(b.X - a.X, 0, b.Z - a.Z).Unit
+        local mid = HWY_AT + Vector3.new(0, 150, 0)
+        local road = HOOK.road
+        if not (road and road.Parent) then
+            road = Instance.new("Part")
+            road.Name, road.Anchored, road.CanCollide = "FIU_PrivateRoad", true, true
+            road.Size = Vector3.new(60, 2, 6000)
+            road.Material, road.Color = Enum.Material.Asphalt, Color3.fromRGB(45, 45, 48)
+            road.CFrame = CFrame.lookAt(mid, mid + axis)
+            road.Parent = workspace
+            HOOK.road = road
+        end
+        local top = road.Position.Y + road.Size.Y / 2
+        local c = Vector3.new(road.Position.X, top, road.Position.Z)
+        return { c - axis * 2900, c + axis * 2900 }, top
+    end
+
     function farm.pending()
         if not (CFG.autoBuy or CFG.autoRepair or CFG.autoSell) then return false end
         for _, e in ipairs(entries()) do
@@ -4775,7 +4799,9 @@ do
         if not e then farm.status = farm.auto and "auto pick: your garage is empty" or "pick a car in the Garage tab first"; farm.retry = farm.auto; return end
         if farm.auto then farm.status = "auto picked " .. entryModel(e) end
         local pts, top, cycle
-        if CFG.driveRoute == "Highway" then
+        if CFG.driveRoute == farm.PRIV then
+            pts, top = farm.privateRoute()
+        elseif CFG.driveRoute == "Highway" then
             pts, top = highwayRoute()
         else
             pts, top = roadRoute()
@@ -4839,8 +4865,15 @@ do
             end
             local km, _, owed = numbers()
             if km > lastKm + 0.001 then lastKm, lastKmAt = km, os.clock()
-            elseif CFG.farmResume and os.clock() - lastKmAt > 120 then
-                farm.status = "stuck: no distance counted for 2 min"; farm.retry = true; break
+            elseif (CFG.farmResume or CFG.driveRoute == farm.PRIV) and os.clock() - lastKmAt > 120 then
+                farm.status = "stuck: no distance counted for 2 min"; farm.retry = true
+                if CFG.driveRoute == farm.PRIV then
+                    CFG.driveRoute = "Highway"
+                    pcall(function() Library.Options.FIU_DriveRoute:SetValue("Highway") end)
+                    farm.retry = true; farm.status = "the game doesn't count the private road: back to the Highway"
+                    notify(farm.status); log("drive farm: " .. farm.status)
+                end
+                break
             end
             if not CFG.driveNoLimit and owed + CFG.driveExtra <= 0 then farm.status = ("done: drove %.2f km"):format(km - farm.startKm); notify("Distance farm done"); break end
             if farm.chosen and not farm.auto and farm.car ~= e then farm.yielded = true; farm.status = "switching car"; break end -- picked another car mid-run
@@ -4850,6 +4883,7 @@ do
                 farm.lastCheck = os.clock()
                 if farm.pending() then farm.yielded = true; farm.status = "paused: auto flip has work"; break end
             end
+            farm.drivingAt, farm.km = os.clock(), km
             farm.status = ("driving · moved %.2f km · counted %.2f km · %s"):format(farm.moved / 3937, km - farm.startKm,
                 CFG.driveNoLimit and "no limit" or ("%.2f km to go"):format(math.max(0, owed + CFG.driveExtra)))
         end
@@ -4970,11 +5004,87 @@ do
             task.wait(1)
         end
     end)
-    FarmBox:AddDropdown("FIU_DriveRoute", { Text = "Route", Values = { "Highway", "City road" }, Default = CFG.driveRoute,
-        Tooltip = "Highway: back and forth on the long straight stretch north of town. City road: the longest straight road in town.", Callback = set("driveRoute") })
+    FarmBox:AddDropdown("FIU_DriveRoute", { Text = "Route", Values = { "Highway", "City road", farm.PRIV }, Default = CFG.driveRoute,
+        Tooltip = "Highway: back and forth on the long straight stretch north of town. City road: the longest straight road in town. Private road: a 6000-stud road only you can see, 150 studs above the highway; if the game doesn't count it, the farm switches back to the Highway after 2 min.",
+        Callback = set("driveRoute") })
     FarmBox:AddSlider("FIU_DriveSpeed", { Text = "Speed", Default = CFG.driveSpeed, Min = 20, Max = 210, Rounding = 0, Suffix = " studs/s",
         Tooltip = "About km/h on the speedometer. Measured 2026-10-02: 150 credited ~0.9-1.0 km/min, 210 only ~0.1-0.5 (the game stops counting most of it).",
         Callback = set("driveSpeed") })
+    -- credited km/min: only seconds spent actually driving count (spawning, waiting for auto flip and turning are out)
+    farm.samples = {}
+    function farm.driving() return farm.drivingAt ~= nil and os.clock() - farm.drivingAt < 1.5 end
+    task.spawn(function()
+        local prevKm, prevT
+        while running do
+            local km = tonumber(Status.KMs.Value) or 0
+            if farm.driving() and prevKm then
+                farm.samples[#farm.samples + 1] = { t = os.clock(), d = math.max(0, km - prevKm), dt = os.clock() - prevT }
+            elseif not farm.driving() then
+                table.clear(farm.samples)
+            end
+            while farm.samples[1] and os.clock() - farm.samples[1].t > 60 do table.remove(farm.samples, 1) end
+            local d, dt = 0, 0
+            for _, x in ipairs(farm.samples) do d += x.d; dt += x.dt end
+            farm.rate = dt >= 20 and d / (dt / 60) or nil
+            prevKm, prevT = km, os.clock()
+            task.wait(1)
+        end
+    end)
+    -- auto tune: drives each speed for a while, measures credited km/min, keeps the best
+    farm.TUNE, farm.WARM, farm.MEASURE = { 95, 105, 115, 125, 135 }, 15, 150 -- seconds of driving per speed: settle, then measure
+    function farm.tune()
+        if farm.tuning then return end
+        farm.tuning = true
+        local res, best, bestRate = {}, nil, -1
+        for i, sp in ipairs(farm.TUNE) do
+            if not (farm.tuning and running) then break end
+            CFG.driveSpeed = sp
+            pcall(function() Library.Options.FIU_DriveSpeed:SetValue(sp) end)
+            local driven, km0, kmPrev, measured, credited = 0, nil, nil, 0, 0
+            while farm.tuning and running and measured < farm.MEASURE do
+                task.wait(1)
+                if not farm.on then farm.tuneStatus = "tuning paused: turn the farm on"
+                elseif farm.driving() then
+                    driven += 1
+                    local km = farm.km or 0
+                    if driven > farm.WARM then
+                        if kmPrev then credited += math.max(0, km - kmPrev); measured += 1 end
+                    end
+                    kmPrev = km
+                    farm.tuneStatus = ("tuning %d/%d · %d studs/s · %s"):format(i, #farm.TUNE, sp,
+                        driven <= farm.WARM and "settling" or ("%d/%d s · %.2f km/min so far"):format(measured, farm.MEASURE, measured > 0 and credited / (measured / 60) or 0))
+                else
+                    kmPrev = nil -- a stop doesn't count as driving time
+                end
+            end
+            if measured >= farm.MEASURE then
+                local rate = credited / (measured / 60)
+                res[tostring(sp)] = math.floor(rate * 100 + 0.5) / 100
+                if rate > bestRate then best, bestRate = sp, rate end
+            end
+        end
+        if best and farm.tuning then
+            CFG.driveSpeed = best
+            pcall(function() Library.Options.FIU_DriveSpeed:SetValue(best) end)
+            D.tune = { at = os.time(), route = CFG.driveRoute, results = res, best = best }; saveD()
+            local parts = {}
+            for _, sp in ipairs(farm.TUNE) do if res[tostring(sp)] then parts[#parts + 1] = ("%d: %.2f"):format(sp, res[tostring(sp)]) end end
+            farm.tuneStatus = ("tuned: %d studs/s is best (%.2f km/min) · %s"):format(best, bestRate, table.concat(parts, " · "))
+            notify(("Auto tune: %d studs/s (%.2f km/min)"):format(best, bestRate)); log("drive tune: " .. farm.tuneStatus)
+        elseif not best then
+            farm.tuneStatus = "tuning stopped"
+        end
+        farm.tuning = false
+        if farm.tuneToggle then pcall(farm.tuneToggle.SetValue, farm.tuneToggle, false) end
+    end
+    farm.tuneToggle = FarmBox:AddToggle("FIU_DriveTune", { Text = "Auto tune speed", Default = false,
+        Tooltip = ("Turn the farm on, then this: drives %s studs/s for ~3 min each, measures the km the game counts per minute, and keeps the best. Turn off to stop early."):format(table.concat(farm.TUNE, "/")),
+        Callback = function(v)
+            if v then task.spawn(farm.tune) else farm.tuning = false end
+        end })
+    if D.tune and D.tune.best then
+        farm.tuneStatus = ("last tune (%s, %s): %d studs/s was best"):format(tostring(D.tune.route), os.date("%d/%m %H:%M", D.tune.at or 0), D.tune.best)
+    end
     FarmBox:AddSlider("FIU_DriveExtra", { Text = "Keep driving past the debt", Default = CFG.driveExtra, Min = 0, Max = 50, Rounding = 0, Suffix = " km",
         Callback = set("driveExtra") })
     FarmBox:AddToggle("FIU_DriveNoLimit", { Text = "No limit", Default = CFG.driveNoLimit,
@@ -4994,7 +5104,10 @@ do
                     ("Next sale needs %.2f km total (%.2f to go)"):format((sold + 1) * D.kmPerCar, math.max(0, (sold + 1) * D.kmPerCar - km)),
                     D.lastMsg and ("Server said (%s): %s"):format(os.date("%H:%M", D.lastMsgAt or 0), D.lastMsg) or "No distance message from the server seen yet",
                 }, "\n"))
-                farmLabel:SetText(farm.status)
+                local extra = {}
+                if farm.on then extra[#extra + 1] = farm.rate and ("credited %.2f km/min (last minute)"):format(farm.rate) or "credited km/min: measuring..." end
+                if farm.tuneStatus then extra[#extra + 1] = farm.tuneStatus end
+                farmLabel:SetText(farm.status .. (#extra > 0 and ("\n" .. table.concat(extra, "\n")) or ""))
                 if farmToggle.Value ~= farm.on and not farm.on then farmToggle:SetValue(false) end
             end)
             task.wait(1)
