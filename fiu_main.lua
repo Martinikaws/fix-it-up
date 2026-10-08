@@ -161,7 +161,7 @@ local CFG = {
     bringCar = false, walkSpeed = 16, speedOn = false, antiAfk = true,
     cleanAfter = false, paintAfter = false, paintRandom = false, paintMaterial = "Normal", paintColor = Color3.fromRGB(30, 90, 220),
     homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
-    driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
+    driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmResume = true, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
     playerEsp = false, playerCarTitles = true, playerOutline = false, playerMaxDist = 2000, playerColor = Color3.fromRGB(255, 255, 255),
 }
 local STATE = readJSON(DIR .. "/state.json", {})
@@ -4555,19 +4555,19 @@ do
         else
             pts, top = roadRoute()
         end
-        if not pts then farm.status = "no route found"; return end
+        if not pts then farm.status = "no route found"; farm.retry = true; return end
         farm.status = "spawning " .. entryModel(e) .. " on the route (can take ~20 s)"
         streamAt(pts[1], 5)
         local car = spawnCar(e, CFrame.lookAt(pts[1] + Vector3.new(0, 4, 0), pts[2] + Vector3.new(0, 4, 0)))
-        if not car then farm.status = "car didn't spawn"; return end
+        if not car then farm.status = "car didn't spawn"; farm.retry = true; return end
         local h, seat = hum(), car:FindFirstChild("DriveSeat")
-        if not (h and seat) then farm.status = "no seat"; return end
+        if not (h and seat) then farm.status = "no seat"; farm.retry = true; return end
         farm.status = "getting in"
         tpTo(seat.CFrame * CFrame.new(0, 3, 0))
         task.wait(0.3)
         seat:Sit(h)
         task.wait(1.2) -- let it land before measuring its ride height
-        if h.SeatPart ~= seat then farm.status = "couldn't sit in the car"; return end
+        if h.SeatPart ~= seat then farm.status = "couldn't sit in the car"; farm.retry = true; return end
         -- tyres stay on the road: the distance only counts while they turn (floating them 0.6 studs up counted 0 km,
         -- measured 2026-09-28). They're spun to match the car's speed below, so they roll instead of sliding (no screech).
         local ride = math.clamp(car:GetPivot().Position.Y - (top or pts[1].Y), 0.5, 6)
@@ -4586,11 +4586,13 @@ do
         farm.ghost = ghost
         farm.startKm = tonumber(Status.KMs.Value) or 0
         farm.moved = 0
+        farm.runStart = os.clock()
+        local lastKm, lastKmAt = farm.startKm, os.clock() -- watchdog: the game stopped crediting distance
         local i = 2
         while farm.on and running do
             local dt = RunService.Heartbeat:Wait()
-            if h.SeatPart ~= seat then farm.status = "stopped: you left the car"; break end
-            if not car.Parent then farm.status = "stopped: the car despawned"; break end
+            if h.SeatPart ~= seat or not h.Parent then farm.status = "stopped: out of the car"; farm.retry = true; break end
+            if not car.Parent then farm.status = "stopped: the car despawned"; farm.retry = true; break end
             local pos = car:GetPivot().Position
             local target = pts[i]
             local flat = Vector3.new(target.X - pos.X, 0, target.Z - pos.Z)
@@ -4611,6 +4613,10 @@ do
                 farm.moved += step
             end
             local km, _, owed = numbers()
+            if km > lastKm + 0.001 then lastKm, lastKmAt = km, os.clock()
+            elseif CFG.farmResume and os.clock() - lastKmAt > 120 then
+                farm.status = "stuck: no distance counted for 2 min"; farm.retry = true; break
+            end
             if not CFG.driveNoLimit and owed + CFG.driveExtra <= 0 then farm.status = ("done: drove %.2f km"):format(km - farm.startKm); notify("Distance farm done"); break end
             if farm.chosen and farm.car ~= e then farm.yielded = true; farm.status = "switching car"; break end -- picked another car mid-run
             if manualPending then farm.yielded = true; farm.status = "paused for a button"; break end
@@ -4625,7 +4631,7 @@ do
         pcall(function() seat.AssemblyLinearVelocity = Vector3.zero end)
         for _, p in ipairs(farm.ghost or {}) do if p.Parent then p.CanCollide = true end end -- solid again off the farm
         farm.ghost = nil
-        if not farm.yielded then farm.on = false end
+        if not farm.yielded and not (farm.retry and CFG.farmResume) then farm.on = false end
     end
 
     local DistBox = Tabs.Drive:AddLeftGroupbox("Distance owed", "route")
@@ -4634,7 +4640,7 @@ do
         Tooltip = "Learned from the server's message when it refuses a sale for distance; set it by hand if you know it",
         Callback = function(v) D.kmPerCar = v; saveD() end })
     local FarmBox = Tabs.Drive:AddRightGroupbox("Distance farm", "gauge")
-    FarmBox:AddLabel("Spawns the car picked in the Garage tab on the route, seats you and drives until your distance debt is paid plus the extra below. Get out of the car to stop.", true)
+    FarmBox:AddLabel("Spawns the car picked in the Garage tab on the route, seats you and drives until your distance debt is paid plus the extra below. Turn the toggle off to stop.", true)
     local farmToggle = FarmBox:AddToggle("FIU_DriveFarm", { Text = "Farm distance", Default = false, Callback = function(v)
         if v and not farm.on then
             farm.on = true
@@ -4644,6 +4650,7 @@ do
             farm.worker = true
             task.spawn(function()
                 local okLoop, errLoop = pcall(function() -- any error still reaches the cleanup below (else worker stays set)
+                    local fails = 0
                     while farm.on and running do
                         if busy or manualPending then
                             farm.status = "waiting for " .. (busy and tostring(busyWhat) or "a button")
@@ -4655,11 +4662,30 @@ do
                         end
                         if not (farm.on and running) then break end
                         busy, busyWhat = true, "farming distance"
-                        farm.yielded = false
+                        farm.yielded, farm.retry, farm.runStart = false, false, nil
                         local ok, err = pcall(farmRun)
                         busy = false
+                        pcall(function() for _, p in ipairs(farm.ghost or {}) do if p.Parent then p.CanCollide = true end end end); farm.ghost = nil
                         if farm.yielded then CONTEST.wake = true end -- hand over to the auto loop now, not on its next 2 s tick
-                        if not ok then farm.status = "error: " .. tostring(err); log("drive farm: " .. tostring(err)); break end
+                        if not ok then
+                            farm.status = "error: " .. tostring(err); log("drive farm: " .. tostring(err))
+                            if CFG.farmResume then farm.retry = true else break end
+                        end
+                        -- auto resume: anything that stopped the farm except you (toggle off), the debt being paid or the car gone
+                        if farm.retry and CFG.farmResume and farm.on and running then
+                            if farm.runStart and os.clock() - farm.runStart > 60 then fails = 0 end -- it was driving fine
+                            fails += 1
+                            if fails > 20 then farm.status = "gave up after 20 restarts in a row: " .. farm.status; log("drive farm: " .. farm.status); break end
+                            local waitS = math.min(60, 5 * fails)
+                            local why = farm.status
+                            log(("drive farm: %s, resuming in %ds"):format(why, waitS))
+                            local t = os.clock()
+                            repeat
+                                farm.status = ("%s · resuming in %ds (restart %d)"):format(why, math.ceil(waitS - (os.clock() - t)), fails)
+                                task.wait(0.5)
+                            until not farm.on or not running or os.clock() - t > waitS
+                            continue
+                        end
                         if not (farm.yielded and farm.on) then break end
                         -- the auto loop buys / repairs / sells now (it runs every 2 s once busy is free); drive again after
                         local t = os.clock()
@@ -4677,6 +4703,9 @@ do
             farm.on = false
         end
     end })
+    FarmBox:AddToggle("FIU_DriveResume", { Text = "Auto resume", Default = CFG.farmResume,
+        Tooltip = "Starts driving again when the farm stops on its own: kicked out of the car, car despawned or didn't spawn, an error, or distance not counting for 2 min. Waits 5-60 s between tries, gives up after 20 failed restarts in a row. Off: getting out of the car stops the farm.",
+        Callback = set("farmResume") })
     FarmBox:AddToggle("FIU_DriveYield", { Text = "Pause for auto flips", Default = CFG.farmYield,
         Tooltip = "Steps out while Auto has a car to buy, repair or sell (sell timer up), then keeps driving. Needs the Auto toggles on.",
         Callback = set("farmYield") })
