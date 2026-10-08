@@ -4799,8 +4799,12 @@ do
         if not e then farm.status = farm.auto and "auto pick: your garage is empty" or "pick a car in the Garage tab first"; farm.retry = farm.auto; return end
         if farm.auto then farm.status = "auto picked " .. entryModel(e) end
         local pts, top, cycle
+        -- spawn on real ground: the server owns a fresh car's physics and doesn't have the private road, so a car spawned
+        -- on it falls (2026-10-08). The private road is only used once you're seated and driving the car yourself.
+        local spawnPts, spawnTop
         if CFG.driveRoute == farm.PRIV then
             pts, top = farm.privateRoute()
+            spawnPts, spawnTop = highwayRoute()
         elseif CFG.driveRoute == "Highway" then
             pts, top = highwayRoute()
         else
@@ -4808,8 +4812,9 @@ do
         end
         if not pts then farm.status = "no route found"; farm.retry = true; return end
         farm.status = "spawning " .. entryModel(e) .. " on the route (can take ~20 s)"
-        streamAt(pts[1], 5)
-        local car = spawnCar(e, CFrame.lookAt(pts[1] + Vector3.new(0, 4, 0), pts[2] + Vector3.new(0, 4, 0)))
+        spawnPts, spawnTop = spawnPts or pts, spawnTop or top
+        streamAt(spawnPts[1], 5)
+        local car = spawnCar(e, CFrame.lookAt(spawnPts[1] + Vector3.new(0, 4, 0), spawnPts[2] + Vector3.new(0, 4, 0)))
         if not car then farm.status = "car didn't spawn"; farm.retry = true; return end
         local h, seat = hum(), car:FindFirstChild("DriveSeat")
         if not (h and seat) then farm.status = "no seat"; farm.retry = true; return end
@@ -4821,7 +4826,7 @@ do
         if h.SeatPart ~= seat then farm.status = "couldn't sit in the car"; farm.retry = true; return end
         -- tyres stay on the road: the distance only counts while they turn (floating them 0.6 studs up counted 0 km,
         -- measured 2026-09-28). They're spun to match the car's speed below, so they roll instead of sliding (no screech).
-        local ride = math.clamp(car:GetPivot().Position.Y - (top or pts[1].Y), 0.5, 6)
+        local ride = math.clamp(car:GetPivot().Position.Y - (spawnTop or spawnPts[1].Y), 0.5, 6)
         local wheels = {}
         for _, w in ipairs(car:FindFirstChild("Wheels") and car.Wheels:GetChildren() or {}) do
             if w:IsA("BasePart") then wheels[#wheels + 1] = { part = w, r = math.max(0.5, math.max(w.Size.X, w.Size.Y, w.Size.Z) / 2) } end
