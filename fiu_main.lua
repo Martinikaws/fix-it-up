@@ -160,7 +160,7 @@ local CFG = {
     sellCooldown = 0, -- seconds; 0 = learn it from the server's refusal
     bringCar = false, walkSpeed = 16, speedOn = false, antiAfk = true,
     cleanAfter = false, paintAfter = false, paintRandom = false, paintMaterial = "Normal", paintColor = Color3.fromRGB(30, 90, 220),
-    homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
+    homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucNonStop = false, aucSellJunk = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
     driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmResume = true, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
     playerEsp = false, playerCarTitles = true, playerOutline = false, playerMaxDist = 2000, playerColor = Color3.fromRGB(255, 255, 255),
 }
@@ -2444,6 +2444,7 @@ local Window = Library:CreateWindow({
 if not running or getgenv().FIU_TOKEN ~= HOOK.token then running = false; pcall(Library.Unload, Library); return end
 local Tabs = {
     Junk     = Window:AddTab("Junkyard", "car"),
+    Auction  = Window:AddTab("Auctions", "gavel"),
     Auto     = Window:AddTab("Auto", "repeat"),
     Car      = Window:AddTab("Garage", "warehouse"),
     Shop     = Window:AddTab("Parts", "wrench"),
@@ -2588,14 +2589,20 @@ end
 -- ============================== auctions ==============================
 -- 12 garages at Utils.Auctions. Buying one (the "75,000€" MoneyBuy prompt; the RobuxBuy prompt is never touched)
 -- rolls a prize on the server, so nothing predicts it. Not profitable (~€20K average loss per open, the game's own
--- sign says so): every open is capped by a per-run count, a per-run budget and a money floor, all checked before
--- EACH open, and the prompt's price must still read 75,000€.
+-- sign says so). A run opens a set number of cases, or non-stop; the cash floor is checked before EVERY open and the
+-- prompt's price must still read 75,000€.
 do
-local AUC = { price = 75000, running = false, status = "idle", runLog = {} }
+local AUC = { price = 75000, running = false, status = "idle", runLog = {}, TAKEN = "every auction garage is taken right now" }
 getgenv().FIU_MAIN.auc = AUC -- for scripted tests
 STATE.auction = STATE.auction or { opened = 0, spent = 0, won = 0, cars = {} }
-local RARE = { ["Chule El Caminho SS 454"] = true, ["Four JF"] = true, ["Missah Silva S15"] = true, ["Four Mustank Hoonicorn"] = true }
-local function aucFloor() return math.max(CFG.reserve or 0, CFG.aucFloor or 0) end
+AUC.RARE = { ["Chule El Caminho SS 454"] = true, ["Four JF"] = true, ["Missah Silva S15"] = true, ["Four Mustank Hoonicorn"] = true }
+function AUC.floor() return math.max(CFG.reserve or 0, CFG.aucFloor or 0) end
+-- the 4 named prize cars, or anything S tier / exclusive (not a junkyard car at all)
+function AUC.isRare(name)
+    if AUC.RARE[name] then return true end
+    local t = modelTier(name)
+    return t == "S" or t == "EX"
+end
 function AUC.free()
     local A = workspace:FindFirstChild("Utils") and workspace.Utils:FindFirstChild("Auctions")
     if not A then return {} end
@@ -2610,26 +2617,24 @@ function AUC.free()
     return list
 end
 -- one open; returns a result table or nil, reason (nothing spent)
-function AUC.openOne(budgetLeft)
+function AUC.openOne()
     local free = AUC.free()
-    if #free == 0 then return nil, "every auction garage is taken right now" end
+    if #free == 0 then return nil, AUC.TAKEN end
     local pick = free[1]
     local shown = tonumber((pick.pp.ActionText:gsub("[^%d]", "")))
     if shown ~= AUC.price then return nil, "price reads " .. pick.pp.ActionText .. ", expected 75,000€" end
-    if shown > budgetLeft then return nil, "run budget used up" end
-    if myMoney() - shown < aucFloor() then return nil, ("opening would drop you under %s"):format(money(aucFloor())) end
+    if myMoney() - shown < AUC.floor() then return nil, ("next case would take you under %s"):format(money(AUC.floor())) end
     local m0, before = myMoney(), {}
     for _, e in ipairs(entries()) do before[e] = true end
     local asked
     confirmFn = function(text) -- only this garage's price, and only if the floor still holds
         asked = text
         local p = tonumber((tostring(text):match("([%d,]+)%s*€") or ""):gsub(",", ""), 10)
-        return p ~= nil and p <= AUC.price and myMoney() - p >= aucFloor()
+        return p ~= nil and p <= AUC.price and myMoney() - p >= AUC.floor()
     end
     local t0 = os.clock()
     -- game update 2026-10-08: an open 3.5 s after the last one is silently ignored (no charge, no notify); they used to
     -- work 3-4 s apart. Keep pressing the same garage while nothing was charged, up to 40 s.
-    -- ponytail: the cooldown's length wasn't measured; the run log shows how long each open waited
     repeat
         tpTo(CFrame.new(pick.pp.Parent.WorldPosition + Vector3.new(0, 2, 0)))
         task.wait(0.8)
@@ -2646,95 +2651,228 @@ function AUC.openOne(budgetLeft)
     task.wait(2.5) -- the prize lands after the gate opens
     local cache = {}
     for _, c in ipairs(pick.g.Cache:GetChildren()) do cache[#cache + 1] = c.Name end
-    local cars = {}
-    for _, e in ipairs(entries()) do if not before[e] then cars[#cars + 1] = entryModel(e) end end
+    local cars, newE = {}, {}
+    for _, e in ipairs(entries()) do if not before[e] then cars[#cars + 1] = entryModel(e); newE[#newE + 1] = e end end
     return {
-        garage = pick.g.Name, opened = pick.g:GetAttribute("Open") == true, asked = asked, waited = math.floor(os.clock() - t0),
+        newE = newE, garage = pick.g.Name, opened = pick.g:GetAttribute("Open") == true, asked = asked, waited = math.floor(os.clock() - t0),
         delta = myMoney() - m0, cache = cache, cars = cars, notify = lastNotify.t >= t0 and lastNotify.text or nil,
     }
+end
+-- won junk cars: cleaned, then sold at Used Cars. Queue lives in state.json (by garage id) so it survives a crash.
+-- Never sold: rare cars, locked (favorite / auto-locked) cars, the drive-farm car.
+STATE.auction.sell = STATE.auction.sell or {}
+STATE.auction.soldFor = STATE.auction.soldFor or 0
+function AUC.queue(e)
+    STATE.auction.sell[e.Name] = { model = entryModel(e), cleaned = false, cleanFails = 0, next = 0 }
+    saveState()
+end
+-- one ready car: clean it (if not yet), sell it. Returns true if it did any work. Caller makes sure nothing else runs.
+function AUC.sellStep()
+    local Q = STATE.auction.sell
+    for guid, q in pairs(Q) do
+        local e = Garage:FindFirstChild(guid)
+        if not e or isFav(e) or AUC.isRare(q.model) or guid == CFG.farmCarGuid then
+            Q[guid] = nil; saveState() -- gone, locked or rare: not ours to sell
+        elseif os.time() >= (q.next or 0) then
+            local left = sellCooldownLeft(e)
+            if left > 0 then
+                q.next = os.time() + left; q.why = ("sell timer %dm %02ds"):format(left // 60, left % 60)
+            else
+                busy, busyWhat = true, "auction car: " .. q.model
+                if not q.cleaned then
+                    AUC.sellStatus = "cleaning " .. q.model
+                    local okC, msg = cleanCar(e)
+                    if okC then q.cleaned = true
+                    else
+                        q.cleanFails = (q.cleanFails or 0) + 1
+                        if q.cleanFails >= 3 then q.cleaned = true; log(("auction: selling %s uncleaned (%s)"):format(q.model, tostring(msg)))
+                        else q.next = os.time() + 30; q.why = "clean failed: " .. tostring(msg); busy = false; saveState(); return true end
+                    end
+                end
+                AUC.sellStatus = "selling " .. q.model
+                local m0 = myMoney()
+                local okS, msg = sellCar(e, true)
+                goHome()
+                busy = false
+                if okS then
+                    local got = math.max(0, myMoney() - m0)
+                    STATE.auction.soldFor += got
+                    if AUC.run then AUC.run.sold = (AUC.run.sold or 0) + 1; AUC.run.soldFor = (AUC.run.soldFor or 0) + got end
+                    Q[guid] = nil
+                    log(("auction: sold %s for %s"):format(q.model, money(got)))
+                else
+                    q.next = os.time() + 60; q.why = tostring(msg)
+                    log(("auction: couldn't sell %s: %s"):format(q.model, tostring(msg)))
+                end
+                saveState()
+                return true
+            end
+        end
+    end
+    return false
+end
+-- when no run is going: sell queued cars whenever nothing else is busy
+task.spawn(function()
+    while running do
+        task.wait(5)
+        if CFG.aucSellJunk and not AUC.running and not busy and not manualPending and not STAFF.gated() and next(STATE.auction.sell) then
+            guard("auction sell", AUC.sellStep)
+        end
+    end
+end)
+function AUC.rareAlert(cars)
+    local W = HOOK.WH
+    if not (W and W.valid(W.url)) then return end
+    local ping = W.pingMin ~= "Never" and (W.pingId ~= "" and ("<@" .. W.pingId .. ">") or "@everyone") or nil
+    W.push({ content = ping,
+        allowed_mentions = ping and (W.pingId ~= "" and { users = { W.pingId } } or { parse = { "everyone" } }) or { parse = {} },
+        embeds = { { title = "Rare auction car won", description = table.concat(cars, ", "), color = 0xffc828 } } })
 end
 function AUC.start()
     if AUC.running then return end
     AUC.running = true
     task.spawn(function()
-        local count, budget = math.max(0, math.floor(CFG.aucCount or 1)), math.max(0, CFG.aucBudget or AUC.price)
-        -- "Total spend": the budget caps what goes in (wins never refill it). "Net loss": it caps how far down the run
-        -- may get, so wins let it continue. Either way an open only starts if losing its whole 75K stays within budget.
-        local netMode = CFG.aucMode == "Net loss"
-        local spent, net, n = 0, 0, 0
-        AUC.runLog = {}
-        while running and AUC.running and n < count do
-            if STAFF.gated() then AUC.status = "blocked: " .. STAFF.gateMsg break end
+        local nonstop, count = CFG.aucNonStop, math.max(1, math.floor(CFG.aucCount or 1))
+        local R = { n = 0, spent = 0, back = 0, cars = {}, t0 = os.clock(), nonstop = nonstop, count = count }
+        AUC.run, AUC.runLog = R, {}
+        while running and AUC.running do
+            if not nonstop and R.n >= count then AUC.status = ("done: opened %d case%s"):format(R.n, R.n == 1 and "" or "s") break end
+            if myMoney() - AUC.price < AUC.floor() then AUC.status = ("stopped: next case would take you under %s"):format(money(AUC.floor())) break end
+            if STAFF.gated() then AUC.status = "stopped: " .. STAFF.gateMsg break end
             if busy or manualPending then
                 AUC.status = "waiting for " .. tostring(busy and busyWhat or "a button")
                 local t = os.clock()
                 repeat task.wait(0.5) until not (busy or manualPending) or os.clock() - t > 120 or not AUC.running
-                if busy or manualPending or not AUC.running then AUC.status = "stopped: still busy" break end
+                if not AUC.running then break end
+                if busy or manualPending then AUC.status = "stopped: still busy after 2 min" break end
             end
             busy, busyWhat = true, "opening an auction"
-            AUC.status = ("opening %d of %d..."):format(n + 1, count)
-            local okR, r, why = pcall(AUC.openOne, netMode and (budget + net) or (budget - spent))
+            AUC.status = nonstop and ("opening case %d (non-stop)..."):format(R.n + 1) or ("opening case %d of %d..."):format(R.n + 1, count)
+            local okR, r, why = pcall(AUC.openOne)
             busy = false
-            if not okR then AUC.status = "error: " .. tostring(r); log("auction: " .. tostring(r)) break end
+            if not okR then AUC.status = "stopped: error " .. tostring(r); log("auction: " .. tostring(r)) break end
+            if not r and why == AUC.TAKEN then -- other players are in all 12: wait, don't end the run
+                local t = os.clock()
+                repeat AUC.status = ("all auction garages are taken: retrying in %ds"):format(math.ceil(10 - (os.clock() - t))); task.wait(0.5)
+                until not AUC.running or os.clock() - t > 10
+                continue
+            end
             if not r then AUC.status = "stopped: " .. tostring(why) break end
             if not r.opened then
-                AUC.status = "the garage didn't open (nothing bought?): " .. tostring(r.notify or r.asked or "no reply")
+                AUC.status = "stopped: the garage didn't open (nothing bought?): " .. tostring(r.notify or r.asked or "no reply")
                 log("auction: " .. AUC.status)
                 break
             end
-            n += 1; spent += AUC.price
             local prize = r.delta + AUC.price -- money back from this open (0 if the prize was a car)
-            net += prize - AUC.price
+            R.n += 1; R.spent += AUC.price; R.back += math.max(0, prize)
             local A = STATE.auction
             A.opened += 1; A.spent += AUC.price; A.won += math.max(0, prize)
-            for _, c in ipairs(r.cars) do A.cars[#A.cars + 1] = c end
+            local rare = {}
+            for _, c in ipairs(r.cars) do
+                A.cars[#A.cars + 1] = c; R.cars[#R.cars + 1] = c
+                if AUC.isRare(c) then rare[#rare + 1] = c end
+            end
+            if CFG.aucSellJunk then
+                task.wait(1) -- let auto lock see the new car first
+                for _, e in ipairs(r.newE or {}) do
+                    if e.Parent and not isFav(e) and not AUC.isRare(entryModel(e)) then AUC.queue(e) end
+                end
+            end
             saveState()
-            local line = ("%s%s: %s%s%s"):format(r.garage, r.waited > 6 and (" (waited %d s)"):format(r.waited) or "", prize > 0 and ("+" .. money(prize)) or "no cash",
-                #r.cars > 0 and (" · car: " .. table.concat(r.cars, ", ")) or "", #r.cache > 0 and (" · [" .. table.concat(r.cache, ",") .. "]") or "")
-            AUC.runLog[#AUC.runLog + 1] = line
+            local line = ("#%d %s%s%s"):format(R.n, prize > 0 and ("+" .. money(prize)) or "no cash",
+                #r.cars > 0 and (" · car: " .. table.concat(r.cars, ", ")) or "", r.waited > 6 and (" (waited %ds)"):format(r.waited) or "")
+            table.insert(AUC.runLog, 1, line)
+            if #AUC.runLog > 8 then table.remove(AUC.runLog) end
             log("auction " .. line)
-            lifeLog("auction " .. line .. " | " .. tostring(r.asked) .. " | " .. tostring(r.notify))
-            local rare = false
-            for _, c in ipairs(r.cars) do if RARE[c] then rare = true end end
-            if rare then notify("RARE auction car: " .. table.concat(r.cars, ", ")) end
-            if rare and CFG.aucStopRare then AUC.status = "stopped: rare car won!" break end
-            AUC.status = netMode and ("done %d of %d · run net %s · can lose %s more"):format(n, count, money(net), money(math.max(0, budget + net)))
-                or ("done %d of %d · spent %s of %s · run net %s"):format(n, count, money(spent), money(budget), money(net))
+            lifeLog("auction " .. r.garage .. " " .. line .. " | " .. tostring(r.asked) .. " | " .. tostring(r.notify) .. " | " .. table.concat(r.cache, ","))
+            if #rare > 0 then
+                notify("RARE auction car: " .. table.concat(rare, ", "))
+                pcall(AUC.rareAlert, rare)
+                if CFG.aucStopRare then AUC.status = "stopped: rare car won! " .. table.concat(rare, ", ") break end
+            end
+            AUC.status = nonstop and ("opened %d (non-stop)"):format(R.n) or ("opened %d of %d"):format(R.n, count)
+            -- sell the won junk cars that are ready now (a full garage would block the next prize car)
+            while CFG.aucSellJunk and AUC.running and running do
+                local okS, did = pcall(AUC.sellStep)
+                if not okS then log("auction sell: " .. tostring(did)) break end
+                if not did then break end
+            end
         end
+        if not AUC.running and not AUC.status:find("^stopped") then AUC.status = ("stopped by you after %d case%s"):format(R.n, R.n == 1 and "" or "s") end
         AUC.running = false
+        notify("Auctions: " .. AUC.status)
         if CFG.homeAfterTp and running then goHome(true) end
     end)
 end
 getgenv().FIU_MAIN.auction = AUC -- for scripted tests
 
-local AucBox = Tabs.Junk:AddLeftGroupbox("Auctions", "gavel")
-AucBox:AddLabel("Each open costs 75,000€ and the prize is rolled when you buy, so it can't be predicted. Odds (the game's own list): "
-    .. "junk car 40% · €65K 30.5% · €70K 15% · €75K 8% · €150K 4% · €200K 2% · rare car 0.5%. Average return is about €46K cash "
-    .. "+ a junk car per €75K: a loss. Only for hunting the rare cars.", true)
-AucBox:AddInput("FIU_AucCount", { Text = "Opens per run", Default = tostring(CFG.aucCount or 1), Numeric = true, Finished = true,
-    Callback = function(v) CFG.aucCount = math.max(0, math.floor(tonumber(v) or 1)) end })
-AucBox:AddDropdown("FIU_AucMode", { Text = "Budget counts", Values = { "Total spend", "Net loss" }, Default = CFG.aucMode,
-    Tooltip = "Total spend (strict): every 75K counts, wins never refill it. Net loss: stops once the run is down by the budget, "
-        .. "so wins let it keep going (on average it still loses ~€20K per open).", Callback = set("aucMode") })
-AucBox:AddInput("FIU_AucBudget", { Text = "Budget per run (€)", Default = tostring(CFG.aucBudget or 75000), Numeric = true, Finished = true,
-    Tooltip = "No open starts unless losing its whole 75K stays within this", Callback = function(v) CFG.aucBudget = math.max(0, tonumber(v) or 0) end })
-AucBox:AddInput("FIU_AucFloor", { Text = "Never go below (€)", Default = tostring(CFG.aucFloor or 300000), Numeric = true, Finished = true,
-    Tooltip = "No open happens if it would leave you under this (or the Settings reserve, whichever is higher)",
+-- UI: Auctions tab
+local AucRun = Tabs.Auction:AddLeftGroupbox("Run", "gavel")
+AucRun:AddSlider("FIU_AucCases", { Text = "Cases to open", Default = math.clamp(math.floor(CFG.aucCount or 1), 1, 100), Min = 1, Max = 100, Rounding = 0,
+    Tooltip = "How many cases one run opens (ignored in non-stop mode)", Callback = function(v) CFG.aucCount = v end })
+AucRun:AddToggle("FIU_AucNonStop", { Text = "Non-stop mode", Default = CFG.aucNonStop,
+    Tooltip = "Keeps opening until you press Stop, your cash reaches the stop amount, or a rare car is won (if that's on)",
+    Callback = set("aucNonStop") })
+AucRun:AddInput("FIU_AucStopCash", { Text = "Stop at cash (€)", Default = tostring(CFG.aucFloor or 300000), Numeric = true, Finished = true,
+    Tooltip = "No case is opened if it would take you under this (or under Settings > Always keep, whichever is higher)",
     Callback = function(v) CFG.aucFloor = math.max(0, tonumber(v) or 0) end })
-AucBox:AddToggle("FIU_AucStopRare", { Text = "Stop when a rare car hits", Default = CFG.aucStopRare, Callback = set("aucStopRare") })
-AucBox:AddButton({ Text = "Open auctions", DoubleClick = true, Tooltip = "Double-click. Uses the 75,000€ prompt only, never Robux.", Func = function()
+AucRun:AddToggle("FIU_AucStopRare", { Text = "Stop when a rare car is found", Default = CFG.aucStopRare,
+    Tooltip = "Rare = Chule El Caminho SS 454, Four JF, Missah Silva S15, Four Mustank Hoonicorn, or any S tier / exclusive car. A rare win always notifies you (and your webhook).",
+    Callback = set("aucStopRare") })
+AucRun:AddToggle("FIU_AucSellJunk", { Text = "Auto sell won junk cars (cleaned first)", Default = CFG.aucSellJunk,
+    Tooltip = "Each junk car you win goes to the car wash, then to Used Cars. Waits for the sell timer if there is one, keeps trying if the sale is refused. Never sells rare, locked or drive-farm cars. Remembered across crashes.",
+    Callback = set("aucSellJunk") })
+AucRun:AddButton({ Text = "Start", DoubleClick = true, Tooltip = "Double-click. Uses the 75,000€ prompt only, never Robux.", Func = function()
     if STAFF.gated() then notify("Blocked: " .. STAFF.gateMsg) return end
+    if AUC.running then notify("Already running") return end
     AUC.start()
 end })
-AucBox:AddButton({ Text = "Stop", Func = function() AUC.running = false; AUC.status = "stopping after this open" end })
-local aucLabel = AucBox:AddLabel("-", true)
+AucRun:AddButton({ Text = "Stop", Func = function()
+    if AUC.running then AUC.running = false; AUC.status = "stopping after this case..." end
+end })
+local aucPlan = AucRun:AddLabel("-", true)
+
+local AucLive = Tabs.Auction:AddRightGroupbox("This run", "activity")
+local aucLabel = AucLive:AddLabel("-", true)
+local AucAll = Tabs.Auction:AddRightGroupbox("All time", "history")
+local aucAllLabel = AucAll:AddLabel("-", true)
+AucAll:AddButton({ Text = "Reset all-time stats", DoubleClick = true, Tooltip = "Double-click", Func = function()
+    STATE.auction = { opened = 0, spent = 0, won = 0, cars = {}, sell = STATE.auction.sell or {}, soldFor = 0 }; saveState()
+end })
+Tabs.Auction:AddLeftGroupbox("Odds", "percent"):AddLabel("Each case costs 75,000€ and the prize is rolled when you buy, so it can't be predicted. Odds (the game's own list): "
+    .. "junk car 40% · €65K 30.5% · €70K 15% · €75K 8% · €150K 4% · €200K 2% · rare car 0.5%. Average return is about €46K cash "
+    .. "+ a junk car per €75K: a loss. Only for hunting the rare cars.", true)
 task.spawn(function()
     while running do
-        local A = STATE.auction
         pcall(function()
-            aucLabel:SetText(("%s\n%s\nAll time: %d opened · spent %s · cash back %s · net %s%s"):format(AUC.status,
-                #AUC.runLog > 0 and table.concat(AUC.runLog, "\n") or "no opens this run", A.opened, money(A.spent), money(A.won),
-                money(A.won - A.spent), #A.cars > 0 and ("\nCars won: " .. table.concat(A.cars, ", ")) or ""))
+            local floor, m = AUC.floor(), myMoney()
+            local left = math.max(0, math.floor((m - floor) / AUC.price))
+            aucPlan:SetText(("Cash %s · stops at %s\n%s"):format(money(m), money(floor),
+                CFG.aucNonStop and ("Non-stop: up to %d case%s before the stop amount"):format(left, left == 1 and "" or "s")
+                    or ("Will open %d case%s%s"):format(math.min(left, CFG.aucCount or 1), math.min(left, CFG.aucCount or 1) == 1 and "" or "s",
+                        left < (CFG.aucCount or 1) and (" (cash allows only %d)"):format(left) or "")))
+            local qn, qwhy = 0, nil
+            for _, q in pairs(STATE.auction.sell or {}) do qn += 1; qwhy = qwhy or (q.model .. ": " .. tostring(q.why or "waiting")) end
+            local qline = qn > 0 and ("\n\nTo sell: %d car%s · %s"):format(qn, qn == 1 and "" or "s", busyWhat and busy and tostring(busyWhat):find("^auction car") and busyWhat or qwhy) or ""
+            local R = AUC.run
+            if R then
+                local net = R.back - R.spent
+                local mins = (os.clock() - R.t0) / 60
+                net += R.soldFor or 0
+                aucLabel:SetText(("%s\nOpened %d%s · %d min\nSpent %s · cash back %s · cars sold %d for %s\nNet %s\nCars: %s\n\n%s"):format(AUC.status,
+                    R.n, R.nonstop and "" or (" of " .. R.count), math.floor(mins), money(R.spent), money(R.back), R.sold or 0, money(R.soldFor or 0),
+                    (net >= 0 and "+" or "-") .. money(math.abs(net)), #R.cars > 0 and table.concat(R.cars, ", ") or "none",
+                    #AUC.runLog > 0 and table.concat(AUC.runLog, "\n") or "") .. qline)
+            else
+                aucLabel:SetText(AUC.status .. "\nPress Start to begin a run." .. qline)
+            end
+            local A = STATE.auction
+            local last = {}
+            for i = #A.cars, math.max(1, #A.cars - 4), -1 do last[#last + 1] = A.cars[i] end
+            local allNet = A.won + (A.soldFor or 0) - A.spent
+            aucAllLabel:SetText(("%d opened · spent %s · cash back %s · cars sold for %s\nNet %s\nCars won: %d%s"):format(A.opened, money(A.spent), money(A.won),
+                money(A.soldFor or 0), (allNet >= 0 and "+" or "-") .. money(math.abs(allNet)), #A.cars,
+                #last > 0 and (" (latest: " .. table.concat(last, ", ") .. ")") or ""))
         end)
         task.wait(1)
     end
