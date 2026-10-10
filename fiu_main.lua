@@ -4486,62 +4486,49 @@ function CANDY.isCandy(inst, pats)
     return false
 end
 -- one entry per candy: the outermost named instance, with whatever collects it
+-- Measured 2026-10-10: Workspace.Event holds 12 numbered jars (models: LOLLYPOPYS + LOLLYJAR + a ClickDetector) spread
+-- over the map; clicking one collects it. Far ones aren't streamed in, but the slot model and its ClickDetector are,
+-- so every jar is found by its ClickDetector. Name matching is only the fallback if the Event folder goes away.
 function CANDY.scan()
-    local pats, found, seen = CANDY.patterns(), {}, {}
-    local skipRoots = { Vehicles, MoveParts }
-    for _, p in ipairs(Players:GetPlayers()) do if p.Character then skipRoots[#skipRoots + 1] = p.Character end end
+    local found = {}
+    local ev = workspace:FindFirstChild("Event")
+    if ev then
+        for _, slot in ipairs(ev:GetChildren()) do
+            local cd = slot:FindFirstChildWhichIsA("ClickDetector", true)
+            if cd then
+                local ok, pos = pcall(function() return slot:IsA("Model") and slot:GetPivot().Position or slot.Position end)
+                if ok and pos then found[#found + 1] = { inst = slot, cd = cd, pos = pos } end
+            end
+        end
+        if #found > 0 then return found end
+    end
+    local pats = CANDY.patterns()
     for _, d in ipairs(workspace:GetDescendants()) do
-        if (d:IsA("BasePart") or d:IsA("Model")) and CANDY.isCandy(d, pats) then
-            local bad = false
-            for _, r in ipairs(skipRoots) do if d == r or d:IsDescendantOf(r) then bad = true break end end
-            -- outermost: skip it if an ancestor is a candy too (that one is the entry)
-            local a = d.Parent
-            while not bad and a and a ~= workspace do
-                if seen[a] or ((a:IsA("Model") or a:IsA("BasePart")) and CANDY.isCandy(a, pats)) then bad = true end
-                a = a.Parent
-            end
-            -- 2026-10-10 dump: candies are pieces (Handle.Candy) of models in numbered slots, Workspace.Event.<n>; the
-            -- slot is the collectible, so it's the entry and anything inside it may be what collects
-            local ev = workspace:FindFirstChild("Event")
-            if not bad and ev and d:IsDescendantOf(ev) then
-                local slot = d
-                while slot.Parent ~= ev do slot = slot.Parent end
-                if seen[slot] then bad = true else d = slot end
-            end
-            if not bad then
-                seen[d] = true
-                local part = d:IsA("BasePart") and d or d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart", true)
-                if part then
-                    found[#found + 1] = { inst = d, part = part,
-                        pp = d:FindFirstChildWhichIsA("ProximityPrompt", true), cd = d:FindFirstChildWhichIsA("ClickDetector", true),
-                        touch = d:FindFirstChildWhichIsA("TouchTransmitter", true) }
-                end
-            end
+        if (d:IsA("BasePart") or d:IsA("Model")) and CANDY.isCandy(d, pats) and not d:IsDescendantOf(Vehicles) and not d:IsDescendantOf(MoveParts) then
+            local cd, pp = d:FindFirstChildWhichIsA("ClickDetector", true), d:FindFirstChildWhichIsA("ProximityPrompt", true)
+            local part = d:IsA("BasePart") and d or d:FindFirstChildWhichIsA("BasePart", true)
+            if part and (cd or pp) then found[#found + 1] = { inst = d, cd = cd, pp = pp, pos = part.Position } end
         end
     end
     return found
 end
+-- true when the game took it: the jar (or its ClickDetector) went away, or the game sent a notification
 function CANDY.collect(c)
-    local root = hrp()
-    if not root then return false end
-    tpTo(CFrame.new(c.part.Position + Vector3.new(0, 3, 0)))
-    task.wait(0.25)
+    streamAt(c.pos, 3)
+    tpTo(CFrame.new(c.pos + Vector3.new(0, 3, 4)))
+    task.wait(0.35)
+    local t0 = os.clock()
+    local cd = (c.inst.Parent and c.inst:FindFirstChildWhichIsA("ClickDetector", true)) or c.cd
+    if cd and cd.Parent then HOOK.click(cd) end
     if c.pp and c.pp.Enabled then fireproximityprompt(c.pp) end
-    if c.cd then HOOK.click(c.cd) end
-    root = hrp()
-    if root then
-        local tparts = {}
-        if c.touch and c.touch.Parent:IsA("BasePart") then tparts[1] = c.touch.Parent end
-        if c.part then tparts[#tparts + 1] = c.part end
-        for _, tp in ipairs(tparts) do
-            if firetouchinterest then pcall(firetouchinterest, root, tp, 0); task.wait(); pcall(firetouchinterest, root, tp, 1) end
-        end
-        root.CFrame = CFrame.new(c.part.Position) -- stand on it: plain Touched handlers fire too
-    end
-    local t = os.clock()
-    repeat task.wait(0.1) until not c.inst.Parent or os.clock() - t > 1.2
-    return not c.inst.Parent
+    repeat task.wait(0.1) until not c.inst.Parent or (cd and not cd.Parent) or lastNotify.t >= t0 or os.clock() - t0 > 1.5
+    local got = not c.inst.Parent or (cd ~= nil and not cd.Parent) or lastNotify.t >= t0
+    if lastNotify.t >= t0 then CANDY.last = lastNotify.text end
+    return got
 end
+-- each jar is clicked once, then left for CANDY.wait seconds while it's still there (a collected jar that stays put
+-- must not be clicked forever); a jar that respawns is a new instance and gets clicked straight away
+CANDY.done, CANDY.wait = {}, 300
 function CANDY.loop()
     while running and CANDY.on do
         if busy or manualPending or STAFF.gated() then
@@ -4549,34 +4536,35 @@ function CANDY.loop()
             task.wait(1)
         else
             local list, now = CANDY.scan(), os.clock()
-            local root = hrp()
             local todo = {}
             for _, c in ipairs(list) do
-                local sk = CANDY.skip[c.inst]
-                if not (sk and sk.untilT > now) then todo[#todo + 1] = c end
+                if now - (CANDY.done[c.inst] or -1e9) > CANDY.wait then todo[#todo + 1] = c end
             end
-            if root then table.sort(todo, function(a, b) return (a.part.Position - root.Position).Magnitude < (b.part.Position - root.Position).Magnitude end) end
+            for inst in pairs(CANDY.done) do if not inst.Parent then CANDY.done[inst] = nil end end
+            -- shortest hop each time: nearest jar from where we are now
             if #todo == 0 then
-                CANDY.status = #list > 0 and ("%d candies seen, all skipped (can't be taken): retrying soon · collected %d"):format(#list, CANDY.got)
-                    or ("no candies right now · collected %d · checking every 5 s"):format(CANDY.got)
+                local soonest = math.huge
+                for _, c in ipairs(list) do soonest = math.min(soonest, CANDY.wait - (now - (CANDY.done[c.inst] or now))) end
+                CANDY.status = (#list > 0 and ("%d jar(s), all collected · next check in %ds"):format(#list, math.max(0, math.floor(math.min(soonest, 60))))
+                    or "no candy jars in this server right now") .. ("\ncollected %d this session%s"):format(CANDY.got, CANDY.last and ("\nlast: " .. CANDY.last) or "")
                 task.wait(5)
             else
                 busy, busyWhat = true, "collecting candy"
                 local back = hrp() and hrp().CFrame
-                for i, c in ipairs(todo) do
-                    if not (running and CANDY.on) or manualPending then break end
-                    if c.inst.Parent then
-                        CANDY.status = ("collecting %d/%d · collected %d"):format(i, #todo, CANDY.got)
-                        local ok = CANDY.collect(c)
-                        if ok then CANDY.got += 1; CANDY.skip[c.inst] = nil
-                        else
-                            local sk = CANDY.skip[c.inst] or { n = 0, untilT = 0 }
-                            sk.n += 1
-                            if sk.n >= 3 then sk.untilT = os.clock() + 120; sk.n = 0 end
-                            CANDY.skip[c.inst] = sk
-                        end
+                local i = 0
+                while #todo > 0 and running and CANDY.on and not manualPending do
+                    local root = hrp()
+                    local bi = 1
+                    if root then
+                        for k, c in ipairs(todo) do if (c.pos - root.Position).Magnitude < (todo[bi].pos - root.Position).Magnitude then bi = k end end
                     end
-                    if i >= 25 then break end -- let auto flip / the farm have a turn
+                    local c = table.remove(todo, bi)
+                    i += 1
+                    if c.inst.Parent then
+                        CANDY.status = ("collecting jar %s (%d to go) · collected %d"):format(c.inst.Name, #todo, CANDY.got)
+                        if CANDY.collect(c) then CANDY.got += 1 end
+                        CANDY.done[c.inst] = os.clock()
+                    end
                 end
                 if back and CFG.homeAfterTp then goHome(true) elseif back then tpTo(back) end
                 busy = false
@@ -4588,13 +4576,13 @@ function CANDY.loop()
 end
 
 local CBox = Tabs.Candy:AddLeftGroupbox("Candy collector", "candy")
-CBox:AddLabel("Teleports to every candy in the server and collects it. Waits while a repair, sale, auction or button is running. Off by default.", true)
+CBox:AddLabel("Teleports to each of the server's candy jars (Workspace.Event, 12 of them), nearest first, and clicks it. Each jar is clicked once, then checked again every 5 min. Waits while a repair, sale, auction or button is running.", true)
 CBox:AddToggle("FIU_CandyOn", { Text = "Auto collect candy", Default = false, Callback = function(v)
     if v and not CANDY.on then CANDY.on = true; task.spawn(function() guard("candy", CANDY.loop) end)
     elseif not v then CANDY.on = false end
 end })
 CBox:AddInput("FIU_CandyWords", { Text = "Candy names contain", Default = CANDY.words, Finished = true,
-    Tooltip = "Comma-separated, not case-sensitive. Change it if the event's candies are called something else.",
+    Tooltip = "Only used if the game's Event folder is gone: candies are then found by these names (comma-separated).",
     Callback = function(v) CANDY.words = tostring(v); CANDY.skip = {} end })
 local cLabel = CBox:AddLabel("-", true)
 local CInfo = Tabs.Candy:AddRightGroupbox("Find the candies", "search")
