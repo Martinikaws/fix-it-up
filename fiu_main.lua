@@ -4466,12 +4466,29 @@ end)
 end
 do
 -- ============================== candy event ==============================
--- Event added 2026-10-10. Not measured yet: candies are found by NAME ("candy" by
--- default, editable), anywhere in workspace except players' cars, junk cars and characters. Each candy is collected the
--- way it allows: ProximityPrompt, ClickDetector, or touch (firetouchinterest / standing on it). A candy that is still
--- there after 3 tries is skipped for 2 min, so one that can't be taken never stalls the loop.
+-- Measured live 2026-10-10 (Potassium): Workspace.Event holds 12 numbered jars (slots "1".."12"), each a Model with
+-- LOLLYPOPYS + LOLLYJAR + a ClickDetector (MaxActivationDistance 20). Firing a jar's ClickDetector collects it; the jar
+-- does NOT disappear and no per-collect notification fires. The ONLY signal that a jar is collected is that its slot
+-- number appears as a child of PlayerData.Cache.Halloween2 (a StringValue named "1".."12"). That record is persistent
+-- player data, so each jar is a one-time collect: re-clicking a collected jar does nothing. The loop therefore skips
+-- jars already in Halloween2 and stops once all are done, instead of re-clicking every 5 min.
+-- The NAME-based path (words below) is only a fallback for if the Event folder is ever gone.
 local CANDY = { on = false, status = "off", got = 0, skip = {}, words = "candy" }
 HOOK.CANDY = CANDY
+-- PlayerData.Cache.Halloween2: our saved record of which Event jars we've collected (one StringValue per slot number)
+function CANDY.h2()
+    local pd = LP:FindFirstChild("PlayerData")
+    local cache = pd and pd:FindFirstChild("Cache")
+    return cache and cache:FindFirstChild("Halloween2")
+end
+function CANDY.isDone(num)
+    local h = num and CANDY.h2()
+    return h ~= nil and h:FindFirstChild(num) ~= nil
+end
+-- true when we can trust Halloween2 for this server (Event folder present and our data has loaded)
+function CANDY.eventMode()
+    return workspace:FindFirstChild("Event") ~= nil and CANDY.h2() ~= nil
+end
 function CANDY.patterns()
     local t = {}
     for w in tostring(CANDY.words):gmatch("[^,]+") do
@@ -4497,7 +4514,7 @@ function CANDY.scan()
             local cd = slot:FindFirstChildWhichIsA("ClickDetector", true)
             if cd then
                 local ok, pos = pcall(function() return slot:IsA("Model") and slot:GetPivot().Position or slot.Position end)
-                if ok and pos then found[#found + 1] = { inst = slot, cd = cd, pos = pos } end
+                if ok and pos then found[#found + 1] = { inst = slot, cd = cd, pos = pos, num = slot.Name } end
             end
         end
         if #found > 0 then return found end
@@ -4512,15 +4529,22 @@ function CANDY.scan()
     end
     return found
 end
--- true when the game took it: the jar (or its ClickDetector) went away, or the game sent a notification
+-- Event mode: collected when our slot number shows up in Halloween2. Fallback (no Event folder): the jar or its
+-- ClickDetector went away, or the game sent a notification.
 function CANDY.collect(c)
     streamAt(c.pos, 3)
     tpTo(CFrame.new(c.pos + Vector3.new(0, 3, 4)))
     task.wait(0.35)
+    local useH2 = c.num ~= nil and CANDY.h2() ~= nil
     local t0 = os.clock()
     local cd = (c.inst.Parent and c.inst:FindFirstChildWhichIsA("ClickDetector", true)) or c.cd
     if cd and cd.Parent then HOOK.click(cd) end
     if c.pp and c.pp.Enabled then fireproximityprompt(c.pp) end
+    if useH2 then
+        repeat task.wait(0.1) until CANDY.isDone(c.num) or os.clock() - t0 > 2
+        if CANDY.isDone(c.num) then CANDY.last = "jar " .. c.num; return true end
+        return false
+    end
     repeat task.wait(0.1) until not c.inst.Parent or (cd and not cd.Parent) or lastNotify.t >= t0 or os.clock() - t0 > 1.5
     local got = not c.inst.Parent or (cd ~= nil and not cd.Parent) or lastNotify.t >= t0
     if lastNotify.t >= t0 then CANDY.last = lastNotify.text end
@@ -4536,22 +4560,31 @@ function CANDY.loop()
             task.wait(1)
         else
             local list, now = CANDY.scan(), os.clock()
-            local todo = {}
+            local eventMode = CANDY.eventMode()
+            -- a jar is to-do unless it's already recorded in Halloween2 (event mode) or we tried it recently and it
+            -- didn't register (CANDY.done timestamp = last failed attempt, retried after CANDY.wait)
+            local todo, doneCount = {}, 0
             for _, c in ipairs(list) do
-                if now - (CANDY.done[c.inst] or -1e9) > CANDY.wait then todo[#todo + 1] = c end
+                if eventMode and c.num and CANDY.isDone(c.num) then doneCount += 1
+                elseif now - (CANDY.done[c.inst] or -1e9) > CANDY.wait then todo[#todo + 1] = c end
             end
             for inst in pairs(CANDY.done) do if not inst.Parent then CANDY.done[inst] = nil end end
-            -- shortest hop each time: nearest jar from where we are now
             if #todo == 0 then
-                local soonest = math.huge
-                for _, c in ipairs(list) do soonest = math.min(soonest, CANDY.wait - (now - (CANDY.done[c.inst] or now))) end
-                CANDY.status = (#list > 0 and ("%d jar(s), all collected · next check in %ds"):format(#list, math.max(0, math.floor(math.min(soonest, 60))))
-                    or "no candy jars in this server right now") .. ("\ncollected %d this session%s"):format(CANDY.got, CANDY.last and ("\nlast: " .. CANDY.last) or "")
-                task.wait(5)
+                if eventMode then
+                    CANDY.status = (#list > 0 and ("%d/%d jars collected in this server"):format(doneCount, #list)
+                        or "no candy jars in this server right now") .. ("\ncollected %d this session%s"):format(CANDY.got, CANDY.last and ("\nlast: " .. CANDY.last) or "")
+                    -- all cleared: slow re-check in case the event refills; otherwise a short retry window for failed jars
+                    task.wait(doneCount >= #list and #list > 0 and 30 or 5)
+                else
+                    local soonest = math.huge
+                    for _, c in ipairs(list) do soonest = math.min(soonest, CANDY.wait - (now - (CANDY.done[c.inst] or now))) end
+                    CANDY.status = (#list > 0 and ("%d jar(s), all collected · next check in %ds"):format(#list, math.max(0, math.floor(math.min(soonest, 60))))
+                        or "no candy jars in this server right now") .. ("\ncollected %d this session%s"):format(CANDY.got, CANDY.last and ("\nlast: " .. CANDY.last) or "")
+                    task.wait(5)
+                end
             else
                 busy, busyWhat = true, "collecting candy"
                 local back = hrp() and hrp().CFrame
-                local i = 0
                 while #todo > 0 and running and CANDY.on and not manualPending do
                     local root = hrp()
                     local bi = 1
@@ -4559,9 +4592,8 @@ function CANDY.loop()
                         for k, c in ipairs(todo) do if (c.pos - root.Position).Magnitude < (todo[bi].pos - root.Position).Magnitude then bi = k end end
                     end
                     local c = table.remove(todo, bi)
-                    i += 1
                     if c.inst.Parent then
-                        CANDY.status = ("collecting jar %s (%d to go) · collected %d"):format(c.inst.Name, #todo, CANDY.got)
+                        CANDY.status = ("collecting jar %s (%d to go) · collected %d"):format(tostring(c.num or c.inst.Name), #todo, CANDY.got)
                         if CANDY.collect(c) then CANDY.got += 1 end
                         CANDY.done[c.inst] = os.clock()
                     end
@@ -4576,7 +4608,7 @@ function CANDY.loop()
 end
 
 local CBox = Tabs.Candy:AddLeftGroupbox("Candy collector", "candy")
-CBox:AddLabel("Teleports to each of the server's candy jars (Workspace.Event, 12 of them), nearest first, and clicks it. Each jar is clicked once, then checked again every 5 min. Waits while a repair, sale, auction or button is running.", true)
+CBox:AddLabel("Teleports to each uncollected candy jar (Workspace.Event, 12 per server), nearest first, and clicks it. A jar counts as collected once it's recorded in your Halloween data, so each is taken only once and already-collected jars are skipped. Waits while a repair, sale, auction or button is running.", true)
 CBox:AddToggle("FIU_CandyOn", { Text = "Auto collect candy", Default = false, Callback = function(v)
     if v and not CANDY.on then CANDY.on = true; task.spawn(function() guard("candy", CANDY.loop) end)
     elseif not v then CANDY.on = false end
