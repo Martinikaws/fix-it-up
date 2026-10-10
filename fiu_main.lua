@@ -2451,6 +2451,7 @@ local Tabs = {
     Teleport = Window:AddTab("Teleport", "map-pin"),
     Players  = Window:AddTab("Players", "users"),
     Gold     = Window:AddTab("Gold", "coins"),
+    Candy    = Window:AddTab("Candy", "candy"),
     Drive    = Window:AddTab("Drive", "gauge"),
     Hop      = Window:AddTab("Server hop", "server"),
     Chat     = Window:AddTab("Chat", "message-circle"),
@@ -4461,6 +4462,165 @@ World:AddButton({ Text = "Copy workspace folder names", Tooltip = "For finding w
 end })
 task.spawn(function()
     while running do pcall(trLabel.SetText, trLabel, TR.status); task.wait(1) end
+end)
+end
+do
+-- ============================== candy event ==============================
+-- Event added 2026-10-10. Not measured yet: candies are found by NAME ("candy" by
+-- default, editable), anywhere in workspace except players' cars, junk cars and characters. Each candy is collected the
+-- way it allows: ProximityPrompt, ClickDetector, or touch (firetouchinterest / standing on it). A candy that is still
+-- there after 3 tries is skipped for 2 min, so one that can't be taken never stalls the loop.
+local CANDY = { on = false, status = "off", got = 0, skip = {}, words = "candy" }
+HOOK.CANDY = CANDY
+function CANDY.patterns()
+    local t = {}
+    for w in tostring(CANDY.words):gmatch("[^,]+") do
+        w = w:lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if w ~= "" then t[#t + 1] = w end
+    end
+    return t
+end
+function CANDY.isCandy(inst, pats)
+    local n = inst.Name:lower()
+    for _, w in ipairs(pats) do if n:find(w, 1, true) then return true end end
+    return false
+end
+-- one entry per candy: the outermost named instance, with whatever collects it
+function CANDY.scan()
+    local pats, found, seen = CANDY.patterns(), {}, {}
+    local skipRoots = { Vehicles, MoveParts }
+    for _, p in ipairs(Players:GetPlayers()) do if p.Character then skipRoots[#skipRoots + 1] = p.Character end end
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if (d:IsA("BasePart") or d:IsA("Model")) and CANDY.isCandy(d, pats) then
+            local bad = false
+            for _, r in ipairs(skipRoots) do if d == r or d:IsDescendantOf(r) then bad = true break end end
+            -- outermost: skip it if an ancestor is a candy too (that one is the entry)
+            local a = d.Parent
+            while not bad and a and a ~= workspace do
+                if seen[a] or ((a:IsA("Model") or a:IsA("BasePart")) and CANDY.isCandy(a, pats)) then bad = true end
+                a = a.Parent
+            end
+            if not bad then
+                seen[d] = true
+                local part = d:IsA("BasePart") and d or d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    found[#found + 1] = { inst = d, part = part,
+                        pp = d:FindFirstChildWhichIsA("ProximityPrompt", true), cd = d:FindFirstChildWhichIsA("ClickDetector", true),
+                        touch = d:FindFirstChildWhichIsA("TouchTransmitter", true) }
+                end
+            end
+        end
+    end
+    return found
+end
+function CANDY.collect(c)
+    local root = hrp()
+    if not root then return false end
+    tpTo(CFrame.new(c.part.Position + Vector3.new(0, 3, 0)))
+    task.wait(0.25)
+    if c.pp and c.pp.Enabled then fireproximityprompt(c.pp) end
+    if c.cd then HOOK.click(c.cd) end
+    root = hrp()
+    if root then
+        local tparts = {}
+        if c.touch and c.touch.Parent:IsA("BasePart") then tparts[1] = c.touch.Parent end
+        if c.part then tparts[#tparts + 1] = c.part end
+        for _, tp in ipairs(tparts) do
+            if firetouchinterest then pcall(firetouchinterest, root, tp, 0); task.wait(); pcall(firetouchinterest, root, tp, 1) end
+        end
+        root.CFrame = CFrame.new(c.part.Position) -- stand on it: plain Touched handlers fire too
+    end
+    local t = os.clock()
+    repeat task.wait(0.1) until not c.inst.Parent or os.clock() - t > 1.2
+    return not c.inst.Parent
+end
+function CANDY.loop()
+    while running and CANDY.on do
+        if busy or manualPending or STAFF.gated() then
+            CANDY.status = "waiting for " .. tostring(busy and busyWhat or (manualPending and "a button") or STAFF.gateMsg)
+            task.wait(1)
+        else
+            local list, now = CANDY.scan(), os.clock()
+            local root = hrp()
+            local todo = {}
+            for _, c in ipairs(list) do
+                local sk = CANDY.skip[c.inst]
+                if not (sk and sk.untilT > now) then todo[#todo + 1] = c end
+            end
+            if root then table.sort(todo, function(a, b) return (a.part.Position - root.Position).Magnitude < (b.part.Position - root.Position).Magnitude end) end
+            if #todo == 0 then
+                CANDY.status = #list > 0 and ("%d candies seen, all skipped (can't be taken): retrying soon · collected %d"):format(#list, CANDY.got)
+                    or ("no candies right now · collected %d · checking every 5 s"):format(CANDY.got)
+                task.wait(5)
+            else
+                busy, busyWhat = true, "collecting candy"
+                local back = hrp() and hrp().CFrame
+                for i, c in ipairs(todo) do
+                    if not (running and CANDY.on) or manualPending then break end
+                    if c.inst.Parent then
+                        CANDY.status = ("collecting %d/%d · collected %d"):format(i, #todo, CANDY.got)
+                        local ok = CANDY.collect(c)
+                        if ok then CANDY.got += 1; CANDY.skip[c.inst] = nil
+                        else
+                            local sk = CANDY.skip[c.inst] or { n = 0, untilT = 0 }
+                            sk.n += 1
+                            if sk.n >= 3 then sk.untilT = os.clock() + 120; sk.n = 0 end
+                            CANDY.skip[c.inst] = sk
+                        end
+                    end
+                    if i >= 25 then break end -- let auto flip / the farm have a turn
+                end
+                if back and CFG.homeAfterTp then goHome(true) elseif back then tpTo(back) end
+                busy = false
+                task.wait(0.5)
+            end
+        end
+    end
+    CANDY.status = ("off · collected %d this session"):format(CANDY.got)
+end
+
+local CBox = Tabs.Candy:AddLeftGroupbox("Candy collector", "candy")
+CBox:AddLabel("Teleports to every candy in the server and collects it. Waits while a repair, sale, auction or button is running. Off by default.", true)
+CBox:AddToggle("FIU_CandyOn", { Text = "Auto collect candy", Default = false, Callback = function(v)
+    if v and not CANDY.on then CANDY.on = true; task.spawn(function() guard("candy", CANDY.loop) end)
+    elseif not v then CANDY.on = false end
+end })
+CBox:AddInput("FIU_CandyWords", { Text = "Candy names contain", Default = CANDY.words, Finished = true,
+    Tooltip = "Comma-separated, not case-sensitive. Change it if the event's candies are called something else.",
+    Callback = function(v) CANDY.words = tostring(v); CANDY.skip = {} end })
+local cLabel = CBox:AddLabel("-", true)
+local CInfo = Tabs.Candy:AddRightGroupbox("Find the candies", "search")
+CInfo:AddLabel("If nothing gets collected: stand next to a candy, press this, and paste the result in your chat.", true)
+CInfo:AddButton({ Text = "Copy candy info", Func = function()
+    local lines, list = {}, CANDY.scan()
+    lines[#lines + 1] = ("matched %d with: %s"):format(#list, CANDY.words)
+    for i, c in ipairs(list) do
+        if i > 8 then break end
+        lines[#lines + 1] = ("%s (%s) at %s · prompt=%s click=%s touch=%s"):format(c.inst:GetFullName(), c.inst.ClassName,
+            tostring(c.part.Position), tostring(c.pp ~= nil), tostring(c.cd ~= nil), tostring(c.touch ~= nil))
+    end
+    -- what's near you, matched or not
+    local root = hrp()
+    if root then
+        lines[#lines + 1] = "within 25 studs:"
+        local n = 0
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("BasePart") and not d:IsDescendantOf(LP.Character) and (d.Position - root.Position).Magnitude < 25 and d.Size.Magnitude < 12 then
+                n += 1
+                if n > 25 then break end
+                local extra = {}
+                if d:FindFirstChildWhichIsA("ProximityPrompt", true) or (d.Parent and d.Parent:FindFirstChildWhichIsA("ProximityPrompt", true)) then extra[#extra + 1] = "prompt" end
+                if d:FindFirstChildWhichIsA("ClickDetector", true) then extra[#extra + 1] = "click" end
+                if d:FindFirstChildWhichIsA("TouchTransmitter") then extra[#extra + 1] = "touch" end
+                lines[#lines + 1] = ("  %s%s"):format(d:GetFullName(), #extra > 0 and (" [" .. table.concat(extra, ",") .. "]") or "")
+            end
+        end
+    end
+    local text = table.concat(lines, "\n")
+    if setclipboard then pcall(setclipboard, text); notify("Copied candy info: paste it in your chat") else log(text) end
+end })
+task.spawn(function()
+    while running do pcall(cLabel.SetText, cLabel, CANDY.status); task.wait(1) end
 end)
 end
 ThemeManager:SetLibrary(Library)
