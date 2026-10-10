@@ -4500,6 +4500,14 @@ function CANDY.scan()
                 if seen[a] or ((a:IsA("Model") or a:IsA("BasePart")) and CANDY.isCandy(a, pats)) then bad = true end
                 a = a.Parent
             end
+            -- 2026-10-10 dump: candies are pieces (Handle.Candy) of models in numbered slots, Workspace.Event.<n>; the
+            -- slot is the collectible, so it's the entry and anything inside it may be what collects
+            local ev = workspace:FindFirstChild("Event")
+            if not bad and ev and d:IsDescendantOf(ev) then
+                local slot = d
+                while slot.Parent ~= ev do slot = slot.Parent end
+                if seen[slot] then bad = true else d = slot end
+            end
             if not bad then
                 seen[d] = true
                 local part = d:IsA("BasePart") and d or d.PrimaryPart or d:FindFirstChildWhichIsA("BasePart", true)
@@ -4593,29 +4601,55 @@ local CInfo = Tabs.Candy:AddRightGroupbox("Find the candies", "search")
 CInfo:AddLabel("If nothing gets collected: stand next to a candy, press this, and paste the result in your chat.", true)
 CInfo:AddButton({ Text = "Copy candy info", Func = function()
     local lines, list = {}, CANDY.scan()
-    lines[#lines + 1] = ("matched %d with: %s"):format(#list, CANDY.words)
-    for i, c in ipairs(list) do
-        if i > 8 then break end
-        lines[#lines + 1] = ("%s (%s) at %s · prompt=%s click=%s touch=%s"):format(c.inst:GetFullName(), c.inst.ClassName,
-            tostring(c.part.Position), tostring(c.pp ~= nil), tostring(c.cd ~= nil), tostring(c.touch ~= nil))
+    local function attrs(i)
+        local t = {}
+        for k, v in pairs(i:GetAttributes()) do t[#t + 1] = k .. "=" .. tostring(v) end
+        return #t > 0 and (" {" .. table.concat(t, ", ") .. "}") or ""
     end
-    -- what's near you, matched or not
-    local root = hrp()
-    if root then
-        lines[#lines + 1] = "within 25 studs:"
-        local n = 0
-        for _, d in ipairs(workspace:GetDescendants()) do
-            if d:IsA("BasePart") and not d:IsDescendantOf(LP.Character) and (d.Position - root.Position).Magnitude < 25 and d.Size.Magnitude < 12 then
-                n += 1
-                if n > 25 then break end
-                local extra = {}
-                if d:FindFirstChildWhichIsA("ProximityPrompt", true) or (d.Parent and d.Parent:FindFirstChildWhichIsA("ProximityPrompt", true)) then extra[#extra + 1] = "prompt" end
-                if d:FindFirstChildWhichIsA("ClickDetector", true) then extra[#extra + 1] = "click" end
-                if d:FindFirstChildWhichIsA("TouchTransmitter") then extra[#extra + 1] = "touch" end
-                lines[#lines + 1] = ("  %s%s"):format(d:GetFullName(), #extra > 0 and (" [" .. table.concat(extra, ",") .. "]") or "")
+    lines[#lines + 1] = ("matched %d candy slot(s) with: %s"):format(#list, CANDY.words)
+    local ev = workspace:FindFirstChild("Event")
+    if ev then
+        local kids = ev:GetChildren()
+        lines[#lines + 1] = ("Workspace.Event: %d children%s"):format(#kids, attrs(ev))
+        for i, k in ipairs(kids) do
+            if i > 30 then lines[#lines + 1] = "  ..." break end
+            local okP, pos = pcall(function() return k:IsA("Model") and k:GetPivot().Position or k:IsA("BasePart") and k.Position end)
+            lines[#lines + 1] = ("  %s (%s)%s%s"):format(k.Name, k.ClassName, okP and pos and (" at " .. tostring(pos)) or "", attrs(k))
+        end
+        -- full tree of the first 2 slots: what's inside, and what can be touched / pressed / clicked
+        for si = 1, math.min(2, #kids) do
+            lines[#lines + 1] = ("tree of Event.%s:"):format(kids[si].Name)
+            local n = 0
+            for _, d in ipairs(kids[si]:GetDescendants()) do
+                if not (d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("SpecialMesh") or d:IsA("Texture") or d:IsA("Decal")) then
+                    n += 1
+                    if n > 40 then lines[#lines + 1] = "    ..." break end
+                    local depth = 0
+                    local a2 = d.Parent
+                    while a2 and a2 ~= kids[si] do depth += 1; a2 = a2.Parent end
+                    lines[#lines + 1] = ("    %s%s (%s)%s%s"):format(("  "):rep(depth), d.Name, d.ClassName, attrs(d),
+                        d:IsA("BasePart") and (" canTouch=%s transp=%.1f"):format(tostring(d.CanTouch), d.Transparency) or "")
+                end
             end
         end
+    else
+        lines[#lines + 1] = "no Workspace.Event folder"
     end
+    -- remotes that sound like the event (how the server is told a candy was taken)
+    local rem = {}
+    for _, d in ipairs(RS:GetDescendants()) do
+        if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then
+            local n = d:GetFullName():lower()
+            if n:find("candy") or n:find("event") or n:find("halloween") or n:find("collect") or n:find("lolly") then rem[#rem + 1] = d:GetFullName() .. " (" .. d.ClassName .. ")" end
+        end
+    end
+    lines[#lines + 1] = "remotes: " .. (#rem > 0 and table.concat(rem, " | ") or "none matching")
+    -- where your candy count lives
+    local mine = {}
+    for _, d in ipairs(LP:GetDescendants()) do
+        if d:IsA("ValueBase") and (d.Name:lower():find("candy") or d.Name:lower():find("lolly")) then mine[#mine + 1] = d:GetFullName() .. "=" .. tostring(d.Value) end
+    end
+    lines[#lines + 1] = "your candy values: " .. (#mine > 0 and table.concat(mine, " | ") or "none found")
     local text = table.concat(lines, "\n")
     if setclipboard then pcall(setclipboard, text); notify("Copied candy info: paste it in your chat") else log(text) end
 end })
