@@ -2453,6 +2453,7 @@ local Tabs = {
     Gold     = Window:AddTab("Gold", "coins"),
     Candy    = Window:AddTab("Candy", "candy"),
     Drive    = Window:AddTab("Drive", "gauge"),
+    Boost    = Window:AddTab("Boost", "rocket"),
     Hop      = Window:AddTab("Server hop", "server"),
     Chat     = Window:AddTab("Chat", "message-circle"),
     Webhook  = Window:AddTab("Webhook", "bell"),
@@ -4676,6 +4677,134 @@ end })
 task.spawn(function()
     while running do pcall(cLabel.SetText, cLabel, CANDY.status); task.wait(1) end
 end)
+end
+do
+-- ============================== car boost ==============================
+-- Measured live 2026-10-10 (Potassium): cars are A-Chassis and the driver's client owns the car assembly, so we can set
+-- its velocity straight on the DriveSeat (the same primitive the Drive farm already uses). Handling lives in the car's
+-- "A-Chassis Tune" ModuleScript (require-able and writable; PlayerGui "A-Chassis Interface/Drive" reads it live), ride
+-- height/stiffness in four SpringConstraints named "Spring", and the horn is DriveSeat.Horn (a Sound). Everything here is
+-- client-side and is captured per car and put back the instant you leave the seat, so no car is ever left modified.
+local BOOST = {
+    tuneOn = false, topSpeed = 250, power = 1,          -- engine tune (top speed + acceleration)
+    always = false, boostSpeed = 300, boostAccel = 200, -- velocity boost (hold key / always)
+    hornOn = false, hornSpeed = 400, hornDur = 1.2,     -- honk -> boost
+    susOn = false, ride = 1.2, stiff = 1,               -- suspension (ride height + stiffness)
+    status = "not in a car", cur = 0, hornAt = -1e9,
+}
+HOOK.BOOST = BOOST
+local function seatCar() -- the A-Chassis car we're sitting in, plus its DriveSeat
+    local h = hum(); local s = h and h.SeatPart
+    if not s then return nil end
+    local m = s:FindFirstAncestorWhichIsA("Model")
+    while m and not m:FindFirstChild("A-Chassis Tune") and m.Parent do
+        if m.Parent:IsA("Model") then m = m.Parent else break end
+    end
+    if m and m:FindFirstChild("A-Chassis Tune") then return m, s end
+    return nil
+end
+-- originals + horn hookup for the car we're in, so getting out restores it exactly
+local applied
+local function capture(car, seat)
+    local a = { car = car, seat = seat, springs = {} }
+    local okT, T = pcall(require, car:FindFirstChild("A-Chassis Tune"))
+    if okT and type(T) == "table" then
+        a.T = T
+        a.tune = { SpeedLimit = T.SpeedLimit, PeakTorque = T.PeakTorque, RedlineTorque = T.RedlineTorque,
+                   IdleTorque = T.IdleTorque, HPLimit = T.HPLimit }
+    end
+    for _, d in ipairs(car:GetDescendants()) do
+        if d:IsA("SpringConstraint") and d.Name == "Spring" then a.springs[#a.springs + 1] = { c = d, len = d.FreeLength, stiff = d.Stiffness } end
+    end
+    -- horn can be played different ways, so catch both the Played event and the Playing property going true
+    local horn = seat:FindFirstChild("Horn")
+    a.hornConns = {}
+    if horn and horn:IsA("Sound") then
+        local function hit() BOOST.hornAt = os.clock() end
+        a.hornConns[1] = horn.Played:Connect(hit)
+        a.hornConns[2] = horn:GetPropertyChangedSignal("Playing"):Connect(function() if horn.Playing then hit() end end)
+    end
+    return a
+end
+local function restore(a)
+    if not a then return end
+    if a.T and a.tune then for k, v in pairs(a.tune) do a.T[k] = v end end
+    for _, s in ipairs(a.springs) do if s.c.Parent then s.c.FreeLength = s.len; s.c.Stiffness = s.stiff end end
+    for _, c in ipairs(a.hornConns or {}) do c:Disconnect() end
+end
+on(RunService.Heartbeat, function(dt)
+    if not running then return end
+    local car, seat = seatCar()
+    if not car then
+        if applied then restore(applied); applied = nil end
+        BOOST.cur, BOOST.status = 0, "not in a car"
+        return
+    end
+    if not applied or applied.car ~= car then
+        if applied then restore(applied) end
+        applied = capture(car, seat)
+    end
+    local a = applied
+    -- engine tune: live while seated, else keep the car's own values
+    if a.T then
+        if BOOST.tuneOn then
+            a.T.SpeedLimit = BOOST.topSpeed
+            a.T.PeakTorque = a.tune.PeakTorque * BOOST.power
+            a.T.RedlineTorque = a.tune.RedlineTorque * BOOST.power
+            a.T.IdleTorque = a.tune.IdleTorque * BOOST.power
+            a.T.HPLimit = math.max(a.tune.HPLimit, a.tune.HPLimit * BOOST.power)
+        else
+            for k, v in pairs(a.tune) do a.T[k] = v end
+        end
+    end
+    -- suspension
+    for _, s in ipairs(a.springs) do
+        if s.c.Parent then
+            s.c.FreeLength = BOOST.susOn and BOOST.ride or s.len
+            s.c.Stiffness = BOOST.susOn and (s.stiff * BOOST.stiff) or s.stiff
+        end
+    end
+    -- velocity boost: hold key, always-on, or a recent honk
+    local held = false
+    pcall(function() local o = Library.Options.FIU_BoostKey; held = o ~= nil and o:GetState() end)
+    local horn = BOOST.hornOn and (os.clock() - BOOST.hornAt < BOOST.hornDur)
+    local active = held or BOOST.always or horn
+    if active then
+        local target = (horn and not (held or BOOST.always)) and BOOST.hornSpeed or BOOST.boostSpeed
+        BOOST.cur = math.min(target, BOOST.cur + BOOST.boostAccel * dt)
+        local look = seat.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        flat = flat.Magnitude > 0.05 and flat.Unit or look
+        seat.AssemblyLinearVelocity = flat * BOOST.cur + Vector3.new(0, seat.AssemblyLinearVelocity.Y, 0)
+        BOOST.status = ("boosting %s · %d studs/s"):format(horn and "(horn)" or held and "(hold)" or "(always)", math.floor(BOOST.cur))
+    else
+        BOOST.cur = 0
+        BOOST.status = "ready" .. (BOOST.tuneOn and (" · tuned to " .. math.floor(BOOST.topSpeed) .. " studs/s") or "") .. (BOOST.susOn and " · suspension on" or "")
+    end
+end)
+-- UI
+local eng = Tabs.Boost:AddLeftGroupbox("Engine tune", "gauge")
+eng:AddLabel("Tunes the A-Chassis car you're driving. Applies while you're in the seat and is undone when you get out. Top speed and acceleration only show when you drive the car yourself (not while parked).", true)
+eng:AddToggle("FIU_BoostTune", { Text = "Apply engine tune", Default = false, Callback = function(v) BOOST.tuneOn = v end })
+eng:AddSlider("FIU_BoostTop", { Text = "Top speed", Default = 250, Min = 50, Max = 1500, Rounding = 0, Suffix = " studs/s", Callback = function(v) BOOST.topSpeed = v end })
+eng:AddSlider("FIU_BoostPower", { Text = "Acceleration (engine power)", Default = 1, Min = 1, Max = 10, Rounding = 1, Suffix = "x", Callback = function(v) BOOST.power = v end })
+local sus = Tabs.Boost:AddLeftGroupbox("Suspension", "car-front")
+sus:AddLabel("Lowers/raises and stiffens the car (its 4 springs). Ride height 12 = stock.", true)
+sus:AddToggle("FIU_BoostSus", { Text = "Apply suspension", Default = false, Callback = function(v) BOOST.susOn = v end })
+sus:AddSlider("FIU_BoostRide", { Text = "Ride height", Default = 12, Min = 2, Max = 25, Rounding = 0, Suffix = " (tenths)", Callback = function(v) BOOST.ride = v / 10 end })
+sus:AddSlider("FIU_BoostStiff", { Text = "Stiffness", Default = 1, Min = 0.2, Max = 3, Rounding = 1, Suffix = "x", Callback = function(v) BOOST.stiff = v end })
+local bb = Tabs.Boost:AddRightGroupbox("Boost", "rocket")
+bb:AddLabel("Pushes the car forward. Hold the key, or turn on Always. Acceleration is how fast it winds up to the boost speed.", true)
+bb:AddLabel("Hold to boost"):AddKeyPicker("FIU_BoostKey", { Default = "LeftShift", Mode = "Hold", Text = "Hold to boost" })
+bb:AddToggle("FIU_BoostAlways", { Text = "Always boost while driving", Default = false, Callback = function(v) BOOST.always = v end })
+bb:AddSlider("FIU_BoostSpeed", { Text = "Boost speed", Default = 300, Min = 50, Max = 1000, Rounding = 0, Suffix = " studs/s", Callback = function(v) BOOST.boostSpeed = v end })
+bb:AddSlider("FIU_BoostAccel", { Text = "Boost acceleration", Default = 200, Min = 20, Max = 2000, Rounding = 0, Suffix = " studs/s/s", Callback = function(v) BOOST.boostAccel = v end })
+local hb = Tabs.Boost:AddRightGroupbox("Horn boost", "volume-2")
+hb:AddToggle("FIU_BoostHorn", { Text = "Boost when you honk", Default = false, Callback = function(v) BOOST.hornOn = v end })
+hb:AddSlider("FIU_BoostHornSpeed", { Text = "Horn boost speed", Default = 400, Min = 50, Max = 1000, Rounding = 0, Suffix = " studs/s", Callback = function(v) BOOST.hornSpeed = v end })
+hb:AddSlider("FIU_BoostHornDur", { Text = "Horn boost time", Default = 12, Min = 2, Max = 50, Rounding = 0, Suffix = " (tenths of a sec)", Callback = function(v) BOOST.hornDur = v / 10 end })
+local bLabel = Tabs.Boost:AddRightGroupbox("Status", "activity"):AddLabel("-", true)
+task.spawn(function() while running do pcall(bLabel.SetText, bLabel, BOOST.status); task.wait(0.3) end end)
 end
 ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
