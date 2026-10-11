@@ -1788,6 +1788,28 @@ local function buyStep(onlyRare)
     return true
 end
 
+-- the cosmetic steps after a repair, each one saved as pending until done (OWNED[guid].cleanPending / paintPending).
+-- Stops early when a hop is waiting (STAFF.leaving) so the job ends and the hop can start; whatever is left is picked
+-- up by autoStep in the new server. A step that fails twice is dropped so selling is never blocked for good.
+function HOOK.finishLook(e, o)
+    local function step(flag, on, run)
+        if not o[flag] then return end
+        if not on then o[flag] = nil return end -- turned off since the repair
+        if STAFF.leaving then return end
+        local ok, msg = run()
+        log(msg)
+        if ok then o[flag] = nil
+        else
+            o.lookTries = (o.lookTries or 0) + 1
+            o.nextTry = os.time() + 15 -- don't hammer a busy wash / booth
+            if o.lookTries >= 2 then o[flag] = nil end
+        end
+    end
+    step("cleanPending", CFG.cleanAfter, function() return cleanCar(e) end)
+    step("paintPending", CFG.paintAfter, function() return paintCar(e, paintColor(), CFG.paintMaterial) end)
+    saveOwned()
+end
+
 local function autoStep()
     if busy or manualPending then return end
     -- 0) a junkyard refresh spawns a car every ~2 s for ~20 s. Don't commit to anything (a buy, or a repair that
@@ -1811,11 +1833,23 @@ local function autoStep()
                 busy, busyWhat = true, "repairing " .. entryModel(e)
                 local ok, msg = repairCar(e)
                 o.tries = (o.tries or 0) + 1
-                if ok or o.tries >= 2 then o.repaired = true end -- two tries, then sell it as it is
+                if ok or o.tries >= 2 then
+                    o.repaired = true -- two tries, then sell it as it is
+                    o.cleanPending, o.paintPending, o.lookTries = CFG.cleanAfter or nil, CFG.paintAfter or nil, nil
+                end
                 saveOwned()
                 log(msg)
-                if o.repaired and CFG.cleanAfter then local _, m2 = cleanCar(e); log(m2) end
-                if o.repaired and CFG.paintAfter then local _, m3 = paintCar(e, paintColor(), CFG.paintMaterial); log(m3) end
+                -- clean / paint right away, unless a hop is waiting: the repair (parts in the machines) is the only
+                -- step a server change would wipe, so the rest carries on in the next server
+                if o.repaired then HOOK.finishLook(e, o) end
+                goHome()
+                busy = false
+                return
+            end
+            -- clean / paint left over (a hop cut in after the repair, or a crash): do them before selling
+            if o.repaired and (o.cleanPending or o.paintPending) then
+                busy, busyWhat = true, "cleaning " .. entryModel(e)
+                HOOK.finishLook(e, o)
                 goHome()
                 busy = false
                 return
@@ -2337,9 +2371,9 @@ function STAFF.leave()
 end
 
 -- Keyword hop: someone says one of your keywords in chat -> hop to another server (once). Messages from you are never
--- checked. Same "let the running job finish" idea as STAFF.leave: a repair has loose engine parts on the floor that a
--- teleport would strand, and clean + paint run inside the same job, so by the time it ends the car is repaired and clean
--- and selling carries on in the new server (queue_on_teleport reloads the script there, as with every hop).
+-- checked. Same "let the running job finish" idea as STAFF.leave: a repair has loose engine parts in the machines that a
+-- teleport would wipe. Only the repair has to finish: clean / paint are saved as pending (HOOK.finishLook) and done in
+-- the new server, then it sells (queue_on_teleport reloads the script there, as with every hop).
 function STAFF.kwMatch(msg) -- the keyword that matched, or nil
     local low = tostring(msg):lower()
     for w in tostring(HOP.kwWords or ""):gmatch("[^,\n]+") do
@@ -5331,6 +5365,7 @@ do
             local o = OWNED[e.Name]
             if o and os.time() >= (o.nextTry or 0) then
                 if CFG.autoRepair and not o.repaired then return true end
+                if o.repaired and (o.cleanPending or o.paintPending) then return true end
                 if CFG.autoSell and not isFav(e) and e.Name ~= CFG.farmCarGuid and (o.repaired or not CFG.autoRepair)
                     and sellCooldownLeft(e) <= 0 then return true end
             end
@@ -5823,7 +5858,7 @@ STAFF.ui.rules:AddButton({ Text = "Forget chat history", DoubleClick = true, Too
     STAFF.saveChat(); notify("Chat history cleared (blocks kept)")
 end })
 STAFF.ui.kw = Tabs.Chat:AddRightGroupbox("Keyword hop", "zap")
-STAFF.ui.kw:AddLabel("When someone else says one of these words in chat, the script hops to another server once. By default it first lets the running repair / clean job finish; selling carries on in the new server. Your own messages are never checked.", true)
+STAFF.ui.kw:AddLabel("When someone else says one of these words in chat, the script hops to another server once. By default it first lets a running repair finish (the parts in the machines would be wiped); clean, paint and selling carry on in the new server. Your own messages are never checked.", true)
 STAFF.ui.kw:AddToggle("FIU_KwOn", { Text = "Hop on chat keywords", Default = HOP.kwOn,
     Callback = function(v) HOP.kwOn = v; saveHop() end })
 STAFF.ui.kw:AddInput("FIU_KwWords", { Text = "Keywords (comma separated)", Default = HOP.kwWords, Placeholder = "report, scam, hacker, mod",
@@ -5833,7 +5868,7 @@ STAFF.ui.kw:AddToggle("FIU_KwWhole", { Text = "Whole words only", Default = HOP.
     Tooltip = "On: 'mod' matches 'mod' but not 'model'. Off: any text containing the keyword.",
     Callback = function(v) HOP.kwWhole = v; saveHop() end })
 STAFF.ui.kw:AddToggle("FIU_KwWait", { Text = "Finish the current job first", Default = HOP.kwWait,
-    Tooltip = "On: waits for a running repair / clean / sale to end before hopping (a repair has loose parts on the floor). Off: hops right away.",
+    Tooltip = "On: waits for a running repair (or other action) to end before hopping; clean and paint are left for the new server. Off: hops right away, which wipes parts that are in the repair machines.",
     Callback = function(v) HOP.kwWait = v; saveHop() end })
 STAFF.ui.kwLabel = STAFF.ui.kw:AddLabel("-", true)
 task.spawn(function()

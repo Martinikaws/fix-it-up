@@ -68,7 +68,7 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
   - 3D-rendering toggle with its own key;
   - Traffic section (disable traffic / disable traffic collisions, both on at every load) — *untested: the traffic folder hasn't been found*.
 - Server hop: Prefer Largest/Smallest option; settings per account; a notification when a rule break triggers a hop.
-- **Chat keyword hop** (Chat tab → Keyword hop): `STAFF.noteChat` checks every line other players say against `HOP.kwWords`; a match runs `STAFF.chatHop`, which sets `STAFF.leaving` (gates new actions), waits for the running job (repair + clean run as one job), then `STAFF.hopOnce()` hops once via `candidates()` (retries 4 min, then gives up). 90 s cooldown (`HOP.kwLast`) so a keyword in the next server cannot start a loop; also posts to the webhook. *Untested in game.*
+- **Chat keyword hop** (Chat tab → Keyword hop): `STAFF.noteChat` checks every line other players say against `HOP.kwWords`; a match runs `STAFF.chatHop`, which sets `STAFF.leaving` (gates new actions), waits for the running job, then `STAFF.hopOnce()` hops once via `candidates()` (retries 4 min, then gives up). 90 s cooldown (`HOP.kwLast`) so a keyword in the next server cannot start a loop; also posts to the webhook. Only the repair must finish before the hop (parts in the machines are wiped by a server change); clean/paint are saved as `cleanPending`/`paintPending` on the owned entry and done by `HOOK.finishLook` (right after the repair if no hop is waiting, otherwise in the new server by `autoStep` before selling). *Untested in game.*
 - Drive farm:
   - auto resume (with a "no km counted for 2 min" watchdog);
   - Auto pick car;
