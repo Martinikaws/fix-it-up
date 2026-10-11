@@ -1940,7 +1940,7 @@ local req = request or http_request or (syn and syn.request)
 local HOP_FILE, VISIT_TTL = ("fiu_hop_%d.json"):format(LP.UserId), 3600
 local HOP = readJSON(HOP_FILE, nil)
 if not HOP then HOP = readJSON("fiu_hop.json", {}); HOP.auto = false; HOP.hops = 0 end
-for k, v in pairs({ auto = false, max = 50, over = 0, maxp = 8, hops = 0, visited = {}, hard = false, hardMax = 1500, gate = false, leaveOnFail = false, chatBlock = true, chatSpam = false, chatSpamN = 20,
+for k, v in pairs({ auto = false, max = 50, over = 0, maxp = 8, hops = 0, visited = {}, hard = false, hardMax = 1500, gate = false, leaveOnFail = false, chatBlock = true, chatSpam = false, chatSpamN = 20, kwOn = false, kwWords = "", kwWhole = true, kwWait = true,
     antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest" }) do if HOP[k] == nil then HOP[k] = v end end
 local function saveHop() writeJSON(HOP_FILE, HOP) end
 do
@@ -2155,10 +2155,15 @@ STAFF.chatRecent, STAFF.chatLines = {}, setmetatable({}, { __mode = "k" })
 function STAFF.saveChat() writeJSON(DIR .. "/chatters.json", STAFF.chat) end
 function STAFF.noteChat(name, text, where)
     if not name or name == "" or name == LP.Name or name == LP.DisplayName then return end
+    local full = tostring(text or ""):gsub("<[^>]+>", "") -- untruncated, for the keyword check
     text = tostring(text or ""):gsub("<[^>]+>", ""):gsub("^%s+", ""):sub(1, 80)
     local key, now = name .. "|" .. text, os.clock()
     if STAFF.chatRecent[key] and now - STAFF.chatRecent[key] < 120 then return end -- same line seen both ways
     STAFF.chatRecent[key] = now
+    if HOP.kwOn and (HOP.kwWords or "") ~= "" then
+        local w = STAFF.kwMatch(full)
+        if w then task.spawn(STAFF.chatHop, name, full, w) end
+    end
     local u = STAFF.chat.users[name] or { count = 0 }
     u.count += 1
     u.last, u.lastAt, u.where = text, os.time(), where
@@ -2329,6 +2334,78 @@ function STAFF.leave()
     lifeLog("rules broken: hopping")
     notify("Server broke your rules: hopping (turn off 'Hop away when the server breaks the rules' to stop this)")
     if hopToggle then hopToggle:SetValue(true) else HOP.auto = true; saveHop(); task.spawn(hopRun) end
+end
+
+-- Keyword hop: someone says one of your keywords in chat -> hop to another server (once). Messages from you are never
+-- checked. Same "let the running job finish" idea as STAFF.leave: a repair has loose engine parts on the floor that a
+-- teleport would strand, and clean + paint run inside the same job, so by the time it ends the car is repaired and clean
+-- and selling carries on in the new server (queue_on_teleport reloads the script there, as with every hop).
+function STAFF.kwMatch(msg) -- the keyword that matched, or nil
+    local low = tostring(msg):lower()
+    for w in tostring(HOP.kwWords or ""):gmatch("[^,\n]+") do
+        w = w:lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if w ~= "" then
+            local pat = w:gsub("%p", "%%%0")
+            if HOP.kwWhole then -- whole words: "mod" must not fire on "model"
+                if w:find("^%w") then pat = "%f[%w]" .. pat end
+                if w:find("%w$") then pat = pat .. "%f[%W]" end
+            end
+            if low:find(pat) then return w end
+        end
+    end
+    return nil
+end
+-- one hop to a fresh server (the Prefer / Max other players settings pick it); retries for 4 minutes, then gives up
+function STAFF.hopOnce()
+    local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    if q and not hopQueued then hopQueued = pcall(q, RELOAD) end
+    local deadline = os.clock() + 240
+    while running and os.clock() < deadline do
+        local s, why = candidates()
+        if s then
+            HOP.visited[s.id] = os.time(); HOP.hops += 1; saveHop()
+            hopStatus = ("keyword hop -> %d/%d players"):format(s.playing, s.maxPlayers)
+            lifeLog(("keyword hop -> %s (%d players)"):format(s.id:sub(1, 8), s.playing))
+            pcall(TeleportService.TeleportToPlaceInstance, TeleportService, game.PlaceId, s.id, LP)
+            task.wait(15) -- normally gone before this; still here = it failed, try the next one
+        else
+            hopStatus = ("keyword hop: no server to go to yet (%s), retrying"):format(tostring(why or "none under the player cap"))
+            task.wait(why == 429 and 30 or 10)
+        end
+    end
+    return false
+end
+function STAFF.chatHop(name, msg, word)
+    if not (running and HOP.kwOn) or STAFF.leaving or STAFF.kwBusy or hopping then return end
+    if os.time() - (HOP.kwLast or 0) < 90 then return end -- a keyword in the next server must not start a hop loop
+    STAFF.kwBusy = true
+    HOP.kwLast = os.time()
+    local shown = tostring(msg):gsub("%s+", " "):sub(1, 120)
+    HOP.kwInfo = ("%s · %s said \"%s\" (keyword '%s')"):format(os.date("%H:%M"), tostring(name), shown, word)
+    saveHop()
+    lifeLog("chat keyword: " .. HOP.kwInfo)
+    notify(("Chat keyword '%s' from %s: hopping%s"):format(word, tostring(name), HOP.kwWait and " after the current job" or " now"))
+    pcall(function()
+        local W = HOOK.WH
+        if W and W.valid(W.url) then
+            W.push({ allowed_mentions = { parse = {} }, embeds = { { title = "Chat keyword: hopping",
+                description = ("**%s** said: %s"):format(tostring(name), (shown:gsub("`", "'"))), color = 0xe67e22,
+                fields = { { name = "Keyword", value = word, inline = true } } } } })
+        end
+    end)
+    STAFF.leaving = true -- gate: auto, buttons, farm, auctions and candy start nothing new
+    hopStatus = "chat keyword: " .. (HOP.kwWait and "finishing the current job, then hopping" or "hopping")
+    if HOP.kwWait then
+        local t = os.clock()
+        while running and (busy or manualPending) and os.clock() - t < 600 do task.wait(0.5) end
+        task.wait(1) -- let a finished job's last parts settle into the car / inventory
+    end
+    local ok = running and STAFF.hopOnce()
+    if running and not ok then
+        hopStatus = "keyword hop gave up (no server found): staying"
+        notify("Keyword hop: no server found, staying here")
+    end
+    STAFF.leaving, STAFF.kwBusy = false, false
 end
 
 -- ============================== unload ==============================
@@ -4811,7 +4888,7 @@ SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 -- a config is the WHOLE menu: every toggle (distance farm, auto hop, gold contract included), slider, dropdown, input
 -- and color is saved and loaded. Nothing is excluded (user, 2026-10-01: "the configs will save the configuration of the menu").
-SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol" })
+SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
 -- CruelHub look: near-black with a crimson accent (still switchable under Settings > Themes)
@@ -5745,6 +5822,26 @@ STAFF.ui.rules:AddButton({ Text = "Forget chat history", DoubleClick = true, Too
     for name, u in pairs(STAFF.chat.users) do if not u.blocked then STAFF.chat.users[name] = nil end end
     STAFF.saveChat(); notify("Chat history cleared (blocks kept)")
 end })
+STAFF.ui.kw = Tabs.Chat:AddRightGroupbox("Keyword hop", "zap")
+STAFF.ui.kw:AddLabel("When someone else says one of these words in chat, the script hops to another server once. By default it first lets the running repair / clean job finish; selling carries on in the new server. Your own messages are never checked.", true)
+STAFF.ui.kw:AddToggle("FIU_KwOn", { Text = "Hop on chat keywords", Default = HOP.kwOn,
+    Callback = function(v) HOP.kwOn = v; saveHop() end })
+STAFF.ui.kw:AddInput("FIU_KwWords", { Text = "Keywords (comma separated)", Default = HOP.kwWords, Placeholder = "report, scam, hacker, mod",
+    Tooltip = "Not case-sensitive. Several words or phrases separated by commas. Saved as you type.",
+    Callback = function(v) HOP.kwWords = tostring(v or ""); saveHop() end })
+STAFF.ui.kw:AddToggle("FIU_KwWhole", { Text = "Whole words only", Default = HOP.kwWhole,
+    Tooltip = "On: 'mod' matches 'mod' but not 'model'. Off: any text containing the keyword.",
+    Callback = function(v) HOP.kwWhole = v; saveHop() end })
+STAFF.ui.kw:AddToggle("FIU_KwWait", { Text = "Finish the current job first", Default = HOP.kwWait,
+    Tooltip = "On: waits for a running repair / clean / sale to end before hopping (a repair has loose parts on the floor). Off: hops right away.",
+    Callback = function(v) HOP.kwWait = v; saveHop() end })
+STAFF.ui.kwLabel = STAFF.ui.kw:AddLabel("-", true)
+task.spawn(function()
+    while running do
+        pcall(STAFF.ui.kwLabel.SetText, STAFF.ui.kwLabel, HOP.kwInfo and ("Last trigger: " .. HOP.kwInfo) or "No keyword hop yet")
+        task.wait(2)
+    end
+end)
 task.spawn(function()
     local lastKey = ""
     while running do

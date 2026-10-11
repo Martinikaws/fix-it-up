@@ -68,6 +68,7 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
   - 3D-rendering toggle with its own key;
   - Traffic section (disable traffic / disable traffic collisions, both on at every load) — *untested: the traffic folder hasn't been found*.
 - Server hop: Prefer Largest/Smallest option; settings per account; a notification when a rule break triggers a hop.
+- **Chat keyword hop** (Chat tab → Keyword hop): `STAFF.noteChat` checks every line other players say against `HOP.kwWords`; a match runs `STAFF.chatHop`, which sets `STAFF.leaving` (gates new actions), waits for the running job (repair + clean run as one job), then `STAFF.hopOnce()` hops once via `candidates()` (retries 4 min, then gives up). 90 s cooldown (`HOP.kwLast`) so a keyword in the next server cannot start a loop; also posts to the webhook. *Untested in game.*
 - Drive farm:
   - auto resume (with a "no km counted for 2 min" watchdog);
   - Auto pick car;
