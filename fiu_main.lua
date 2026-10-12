@@ -4379,27 +4379,37 @@ local Menu = Tabs.Settings:AddLeftGroupbox("Menu", "menu")
 -- open/close key: click the box, press any key. Kept in FixItUp/menukey.json so it survives hops and reloads
 -- even without a saved config (a SaveManager autoload, if any, also restores it)
 do
-    local saved = readJSON(DIR .. "/menukey.json", {}).key
-    local def = (saved and Enum.KeyCode[saved] and saved) or "RightControl"
+    -- Indexing Enum.KeyCode with a name it doesn't have THROWS (it doesn't return nil), and the key picker also hands
+    -- back non-KeyCode values (mouse buttons "MB1".."MB3", "None", modifier text). Saving one of those used to make the
+    -- next load die on this line until menukey.json was deleted, so every lookup is checked, and unusable values are never stored.
+    function HOOK.keyName(k) -- a name the picker can use as Default, or nil
+        if typeof(k) == "EnumItem" then k = k.Name end
+        if type(k) ~= "string" or k == "" or k == "Unknown" then return nil end
+        if k == "None" or k == "MB1" or k == "MB2" or k == "MB3" then return k end
+        local ok, v = pcall(function() return Enum.KeyCode[k] end)
+        return ok and v and k or nil
+    end
+    function HOOK.keySave(field, k)
+        local n = HOOK.keyName(k)
+        if not n then return end
+        local t = readJSON(DIR .. "/menukey.json", {})
+        if t[field] == n then return end -- unchanged: no write (some executors choke on rewriting the file)
+        t[field] = n
+        writeJSON(DIR .. "/menukey.json", t)
+    end
+    local saved = HOOK.keyName(readJSON(DIR .. "/menukey.json", {}).key)
+    local def = (saved and saved ~= "None" and saved) or "RightControl"
     Menu:AddLabel("Open / close menu"):AddKeyPicker("MenuKeybind", { Default = def, NoUI = true, Text = "Open / close menu",
-        ChangedCallback = function(k)
-            local n = typeof(k) == "EnumItem" and k.Name or tostring(k)
-            if n ~= "" and n ~= "Unknown" then local t = readJSON(DIR .. "/menukey.json", {}); t.key = n; writeJSON(DIR .. "/menukey.json", t) end
-        end })
+        ChangedCallback = function(k) pcall(HOOK.keySave, "key", k) end })
     Library.ToggleKeybind = Library.Options.MenuKeybind
 
     -- 3D rendering off: black world, menu still works. Cuts GPU/CPU while farming AFK. Always back on at load/unload.
-    local rkey = readJSON(DIR .. "/menukey.json", {}).render
-    rkey = (rkey and (rkey == "None" or Enum.KeyCode[rkey]) and rkey) or "None"
+    local rkey = HOOK.keyName(readJSON(DIR .. "/menukey.json", {}).render) or "None"
     Menu:AddToggle("FIU_NoRender", { Text = "Disable 3D rendering", Default = false,
         Tooltip = "Stops drawing the world (saves GPU/CPU while AFK). The menu and the script keep running.",
         Callback = function(v) pcall(RunService.Set3dRenderingEnabled, RunService, not v) end })
         :AddKeyPicker("FIU_NoRenderKey", { Default = rkey, Mode = "Toggle", SyncToggleState = true, Text = "Disable 3D rendering",
-            ChangedCallback = function(k)
-                local n = typeof(k) == "EnumItem" and k.Name or tostring(k)
-                if n == "" or n == "Unknown" then return end
-                local t = readJSON(DIR .. "/menukey.json", {}); t.render = n; writeJSON(DIR .. "/menukey.json", t)
-            end })
+            ChangedCallback = function(k) pcall(HOOK.keySave, "render", k) end })
 end
 Menu:AddButton({ Text = "Unload", Func = function() Library:Unload() end })
 end
