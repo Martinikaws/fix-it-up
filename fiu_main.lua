@@ -978,7 +978,7 @@ local function freeWash(e)
     end
 end
 
-local function cleanCar(e)
+function HOOK.cleanRaw(e)
     local wash, det = freeWash(e)
     if not wash then return false, "no free car wash (all taken or not loaded)" end
     local backMe, oldCar = hrp() and hrp().CFrame, carOf(e)
@@ -1027,6 +1027,16 @@ local function cleanCar(e)
     local left = dirt and dirt.Value or 0
     restore()
     return left <= 1, ("%s dirt %d%%"):format(entryModel(e), math.floor(left))
+end
+
+-- cleanCar switches the Seated state off while you stand at the wash; an error half way (a renamed value after a game
+-- update, say) used to leave it off for good, so every later seat:Sit sat you down and popped you straight out again
+local function cleanCar(e)
+    local ok, a, b = pcall(HOOK.cleanRaw, e)
+    if ok then return a, b end
+    local h = hum()
+    if h then pcall(h.SetStateEnabled, h, Enum.HumanoidStateType.Seated, true) end
+    return false, "clean error: " .. tostring(a)
 end
 
 local MATERIALS = { "Normal", "Shiny", "Matte", "Aluminum", "Metallic" }
@@ -5433,9 +5443,17 @@ do
         farm.status = "getting in"
         tpTo(seat.CFrame * CFrame.new(0, 3, 0))
         task.wait(0.3)
-        seat:Sit(h)
-        task.wait(1.2) -- let it land before measuring its ride height
-        if h.SeatPart ~= seat then farm.status = "couldn't sit in the car"; farm.retry = true; return end
+        pcall(h.SetStateEnabled, h, Enum.HumanoidStateType.Seated, true) -- never left off by an earlier job
+        for try = 1, 3 do
+            if try > 1 then tpTo(seat.CFrame * CFrame.new(0, 3, 0)); task.wait(0.3) end
+            pcall(function() seat.Disabled = false end)
+            seat:Sit(h)
+            local t = os.clock()
+            repeat task.wait(0.1) until h.SeatPart == seat or os.clock() - t > 1.2
+            if h.SeatPart == seat then task.wait(0.5); if h.SeatPart == seat then break end end -- seated and still seated half a second on
+        end
+        task.wait(0.7) -- let it land before measuring its ride height
+        if h.SeatPart ~= seat then farm.status = "couldn't stay in the car (run fiu_debug.lua: Spawn + seat)"; farm.retry = true; return end
         -- tyres stay on the road: the distance only counts while they turn (floating them 0.6 studs up counted 0 km,
         -- measured 2026-09-28). They're spun to match the car's speed below, so they roll instead of sliding (no screech).
         local ride = math.clamp(car:GetPivot().Position.Y - (spawnTop or spawnPts[1].Y), 0.5, 6)

@@ -87,6 +87,10 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 - Auctions auto sell: check the wash → sell flow and the sell timer on won cars.
 - Auto tune results on the Highway (the first run was spoiled by the removed private road).
 
+## Debug script
+
+`fiu_debug.lua` (standalone, not loaded by the main script) tests the game pieces the script depends on and writes a report to `FixItUp/debug_<UserId>.txt` and the clipboard: executor functions, game paths, repair shops/machines, store clicks (fireclickdetector vs real clicks), spawn + five ways of sitting in the DriveSeat with state/message logging, a drive-loop ejection check, and hood + remove/reinstall one part. It unloads the main script first. Load it with `loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up/main/fiu_debug.lua"))()`. Paste its report back when auto/drive misbehaves.
+
 ## Potassium MCP (local only)
 
 The owner runs the Potassium executor, which exposes an MCP server at `http://127.0.0.1:8225/mcp` with a bearer token. Add it to your **local** Claude Code config; never commit the token. With it, you can run Lua in the live client to inspect `Workspace.Event`, find the traffic folder, and check values before changing the script.
