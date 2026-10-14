@@ -1160,6 +1160,13 @@ function CONTEST.near(pos) -- other players within the radius
     end
     return n
 end
+-- wait for a junk refresh to finish before choosing: only when there is a car to buy (j), it's not S tier or rarer (those
+-- are bought on sight), and the wait is capped at 25 s per refresh so repairs and sales can't be held up for ever
+function CONTEST.waiting(j)
+    if not j or TIER_RANK[j.tier] <= TIER_RANK.S then return false end
+    if os.clock() - (CONTEST.lastSpawn or 0) >= CFG.buySettle then return false end
+    return os.clock() - (CONTEST.waveStart or 0) < 25
+end
 function CONTEST.snipes(tier, from) return TIER_RANK[tier] <= (TIER_RANK[from] or 0) end -- "Never" ranks 0
 assert(CONTEST.snipes("A", "A") and CONTEST.snipes("S", "A") and not CONTEST.snipes("B", "A") and not CONTEST.snipes("S", "Never"), "snipe self-check")
 function CONTEST.snipe(j) return CONTEST.snipes(j.tier, CFG.snipeTier) end
@@ -1318,6 +1325,7 @@ local function scanJunk()
             local j = junkInfo(m)
             junk[m] = j
             makeEsp(j)
+            if os.clock() - (CONTEST.lastSpawn or -1e9) > 10 then CONTEST.waveStart = os.clock() end -- a new refresh begins
             CONTEST.lastSpawn = os.clock() -- a refresh swaps the 10 cars one every ~2 s: auto buy waits for the wave
             -- spawn log, to test "do fuller servers spawn rarer cars?" (skips the cars already there when the script loads)
             if CONTEST.scanned then pcall(function()
@@ -1825,12 +1833,10 @@ local function autoStep()
     -- 0) a junkyard refresh spawns a car every ~2 s for ~20 s. Don't commit to anything (a buy, or a repair that
     -- would block the rare that spawns last) until the wave is over, then pick the rarest. An S-tier or rarer match
     -- is bought on sight: nothing later in the wave can beat it.
-    if CFG.autoBuy and #entries() < garageSlots() and os.clock() - (CONTEST.lastSpawn or 0) < CFG.buySettle then
-        local j = wantedJunk()
-        if not (j and TIER_RANK[j.tier] <= TIER_RANK.S) then
-            autoStatus = "junkyard refreshing: waiting for every car to spawn before choosing"
-            return
-        end
+    -- (no wait when nothing matches the filters: it used to hold repairs and sales back for as long as cars kept spawning)
+    if CFG.autoBuy and #entries() < garageSlots() and CONTEST.waiting(wantedJunk()) then
+        autoStatus = "junkyard refreshing: waiting for every car to spawn before choosing"
+        return
     end
     -- rare matches jump ahead of repairs and sales (another player would take them first)
     if buyStep(true) then return end
@@ -5394,7 +5400,7 @@ do
         if not j then return false end
         -- a refresh is still spawning (one car / ~2 s): auto buy won't choose until it settles, so keep driving instead of
         -- parking for ~20 s (2026-10-02). S tier or rarer is bought on sight, so stop for that at once.
-        if os.clock() - (CONTEST.lastSpawn or 0) < CFG.buySettle and TIER_RANK[j.tier] > TIER_RANK.S then return false end
+        if CONTEST.waiting(j) then return false end
         return true
     end
 
