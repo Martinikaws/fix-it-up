@@ -357,7 +357,10 @@ function T.spawn()
     local function attempt(label, prep)
         exitSeat()
         tp(CFrame.new(seat.Position + Vector3.new(0, 3, 9)))
-        task.wait(0.6)
+        -- back to a clean Running state: the previous attempt can leave Seated on with no seat, and then nothing sits
+        h = hum()
+        if h then h:ChangeState(Enum.HumanoidStateType.Running) end
+        task.wait(0.8)
         h = hum()
         local ev, conns, t = {}, {}, os.clock()
         local function e2(s) ev[#ev + 1] = ("      %.2f %s"):format(os.clock() - t, s) end
@@ -469,11 +472,21 @@ function T.parts()
     until (part and slot.Value == "") or os.clock() - t0 > 6
     chk(slot.Value == "" and part ~= nil, "RemovePart " .. slot.Name, part and ("part appeared in %.1fs: %s"):format(os.clock() - t0, part.Name) or "slot emptied=" .. tostring(slot.Value == "") .. ", no part appeared")
     if part then
-        task.wait(0.5)
+        -- the repair holds a removed part above the car until it's reinstalled (a loose one is left behind); do the same
+        local park = car:GetPivot() * CFrame.new(0, 6, 0)
+        local pin = RunService.Heartbeat:Connect(function()
+            if part.Parent then
+                part:PivotTo(park)
+                part:SetAttribute("DroppedAt", nil)
+                for _, b in ipairs(part:GetDescendants()) do if b:IsA("BasePart") then b.AssemblyLinearVelocity = Vector3.zero; b.AssemblyAngularVelocity = Vector3.zero end end
+            end
+        end)
+        task.wait(0.8)
         car.PartsEvent:FireServer("ReapplyPart", part)
         t0 = os.clock()
         repeat task.wait(0.1) until slot.Value == name or os.clock() - t0 > 6
         chk(slot.Value == name, "ReapplyPart " .. slot.Name, slot.Value == name and ("back in %.1fs"):format(os.clock() - t0) or "NOT reinstalled: " .. part.Name .. " is lying next to the car, put it back by hand")
+        pin:Disconnect()
     end
     if D.start then tp(D.start) end
 end
