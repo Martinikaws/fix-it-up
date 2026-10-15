@@ -2053,7 +2053,7 @@ local HOP_FILE, VISIT_TTL = ("fiu_hop_%d.json"):format(LP.UserId), 3600
 local HOP = readJSON(HOP_FILE, nil)
 if not HOP then HOP = readJSON("fiu_hop.json", {}); HOP.auto = false; HOP.hops = 0 end
 for k, v in pairs({ auto = false, max = 50, over = 0, maxp = 8, hops = 0, visited = {}, hard = false, hardMax = 1500, gate = false, leaveOnFail = false, chatBlock = true, chatSpam = false, chatSpamN = 20, kwOn = false, kwWords = "", kwWhole = true, kwWait = true,
-    antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest" }) do if HOP[k] == nil then HOP[k] = v end end
+    antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest", rejoin = true, rejoinDelay = 5, rejoins = 0 }) do if HOP[k] == nil then HOP[k] = v end end
 local function saveHop() writeJSON(HOP_FILE, HOP) end
 do
     local now = os.time()
@@ -2518,6 +2518,68 @@ function STAFF.chatHop(name, msg, word)
         notify("Keyword hop: no server found, staying here")
     end
     STAFF.leaving, STAFF.kwBusy = false, false
+end
+
+-- ============================== auto rejoin ==============================
+-- A kick, a server shutdown or a lost connection shows Roblox's "Disconnected" box and the farm stopped there until
+-- you came back. With Auto rejoin on: wait a few seconds, teleport back into the game (any server) and the queued
+-- reload starts the script again. Never after the anti-mod's own kick (STAFF.gone: you asked it to leave), and never
+-- when the account was opened somewhere else (error 273), or two clients would keep kicking each other.
+do
+    local GS = game:GetService("GuiService")
+    function STAFF.rejoin(msg)
+        if STAFF.rejoining or not running or not HOP.rejoin or STAFF.gone then return end
+        task.wait(2) -- the connection goes a moment after the box shows
+        if STAFF.rejoining or not running or STAFF.gone then return end
+        local okc, code = pcall(function() return GS:GetErrorCode().Value end)
+        if okc and code == 273 then lifeLog("disconnected: account opened elsewhere, not rejoining") return end
+        -- a failed teleport shows the same box while you're still in the server: only act on a real disconnect
+        -- (2xx codes), or when the client's replicator is gone
+        local dropped = okc and code >= 256 and code < 512
+        if not dropped then
+            local okn, gone = pcall(function()
+                local nc = game:FindService("NetworkClient")
+                return nc ~= nil and nc:FindFirstChild("ClientReplicator") == nil
+            end)
+            dropped = okn and gone
+        end
+        if not dropped then return end
+        STAFF.rejoining = true
+        msg = tostring(msg or ""):gsub("%s+", " "):sub(1, 200)
+        HOP.rejoins = (HOP.rejoins or 0) + 1
+        HOP.rejoinInfo = ("%s · %s"):format(os.date("%H:%M"), msg ~= "" and msg or ("error " .. tostring(code)))
+        saveHop()
+        lifeLog(("disconnected (%s): %s -> rejoining in %ds"):format(tostring(code), msg, HOP.rejoinDelay))
+        pcall(function()
+            local W = HOOK.WH
+            if W and W.valid(W.url) then
+                W.push({ allowed_mentions = { parse = {} }, embeds = { { title = "Disconnected: rejoining",
+                    description = msg ~= "" and msg or "no message", color = 0xe67e22,
+                    fields = { { name = "Rejoins so far", value = tostring(HOP.rejoins), inline = true } } } } })
+            end
+        end)
+        task.wait(math.max(3, HOP.rejoinDelay)) -- also lets the webhook queue send
+        local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+        if q and not hopQueued then hopQueued = pcall(q, RELOAD) end
+        local tries = 0
+        while running do -- no internet yet = the teleport fails: keep trying, slower each time
+            tries += 1
+            hopStatus = ("disconnected: rejoin try %d"):format(tries)
+            pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LP)
+            task.wait(math.min(10 + tries * 5, 60))
+        end
+    end
+    on(GS.ErrorMessageChanged, function(msg) if tostring(msg) ~= "" then task.spawn(STAFF.rejoin, msg) end end)
+    task.spawn(function() -- some executors only surface it as CoreGui's ErrorPrompt
+        pcall(function()
+            local overlay = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 10):WaitForChild("promptOverlay", 10)
+            on(overlay.ChildAdded, function(c)
+                if c.Name ~= "ErrorPrompt" then return end
+                local ok, m = pcall(GS.GetErrorMessage, GS)
+                task.spawn(STAFF.rejoin, ok and m or "")
+            end)
+        end)
+    end)
 end
 
 -- ============================== unload ==============================
@@ -5864,6 +5926,15 @@ end })
 HopInfo:AddButton({ Text = "Forget visited servers", Func = function()
     HOP.visited = { [game.JobId] = os.time() }; saveHop(); notify("Visited list cleared.")
 end })
+do
+    local rj = Tabs.Hop:AddLeftGroupbox("Auto rejoin", "refresh-cw")
+    rj:AddLabel("When Roblox disconnects you (kick, server shutdown, lost connection), joins the game again and reloads "
+        .. "the script. Not after the anti-mod leaves on purpose, and not when the account is opened somewhere else.", true)
+    rj:AddToggle("FIU_Rejoin", { Text = "Auto rejoin", Default = HOP.rejoin, Callback = function(v) HOP.rejoin = v; saveHop() end })
+    rj:AddSlider("FIU_RejoinDelay", { Text = "Wait before rejoining", Default = HOP.rejoinDelay, Min = 3, Max = 60, Rounding = 0, Suffix = " s",
+        Callback = function(v) HOP.rejoinDelay = v; saveHop() end })
+    rj:AddLabel(("Rejoined %d time(s)%s"):format(HOP.rejoins or 0, HOP.rejoinInfo and (" · last: " .. HOP.rejoinInfo) or ""), true)
+end
 
 local ModBox = Tabs.Hop:AddRightGroupbox("Anti-mod", "shield-alert")
 ModBox:AddLabel("Leaves as soon as anyone ranked above Member in the game's group (.workspace) is in the server, including when you join.", true)
