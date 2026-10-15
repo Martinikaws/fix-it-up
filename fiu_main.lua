@@ -1872,13 +1872,17 @@ end
 -- the cosmetic steps after a repair, each one saved as pending until done (OWNED[guid].cleanPending / paintPending).
 -- Stops early when a hop is waiting (STAFF.leaving) so the job ends and the hop can start; whatever is left is picked
 -- up by autoStep in the new server. A step that fails twice is dropped so selling is never blocked for good.
+-- STAFF is declared further down, so it's read through HOOK.STAFF here: the bare name was a nil global in this function
+-- ("attempt to index nil with 'leaving'"), which threw on every pass once clean/paint after repair was on, so the car
+-- was never sold and auto flip stood still. A throwing step now counts as a failed try too.
 function HOOK.finishLook(e, o)
     local function step(flag, on, run)
         if not o[flag] then return end
         if not on then o[flag] = nil return end -- turned off since the repair
-        if STAFF.leaving then return end
-        local ok, msg = run()
-        log(msg)
+        if HOOK.STAFF and HOOK.STAFF.leaving then return end
+        local okR, ok, msg = pcall(run)
+        if not okR then ok, msg = false, ("%s error: %s"):format(flag, tostring(ok)) end
+        log(tostring(msg))
         if ok then o[flag] = nil
         else
             o.lookTries = (o.lookTries or 0) + 1
@@ -2088,6 +2092,7 @@ local STAFF = {
         { "Manager", 253 }, { "Owners", 254 }, { "Holder", 255 } },
     gone = false, status = "watching",
 }
+HOOK.STAFF = STAFF -- for code above this line (HOOK.finishLook), where the local isn't in scope yet
 function STAFF.rank(p) -- one retry: the group web call fails now and then
     for _ = 1, 2 do
         local ok, r = pcall(p.GetRankInGroup, p, STAFF.group)

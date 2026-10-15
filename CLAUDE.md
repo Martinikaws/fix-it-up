@@ -21,6 +21,11 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
      for o in -O0 -O1 -O2; do for g in -g0 -g1 -g2; do luau-compile --null $o $g fiu_main.lua; done; done
      ```
      Get `luau-compile` from https://github.com/luau-lang/luau/releases. Big blocks such as the Drive tab hit the same limit on their own, so keep checking there too.
+   - **Then check for names used before their `local` exists.** A function defined above `local X = ...` that uses `X` reads a nil *global* and throws at runtime, not at compile time. This is what broke auto flip after every repair with clean/paint on (`STAFF.leaving` in `HOOK.finishLook`, 2026-10-15). Any script variable listed here is that bug (Roblox/executor APIs and `decompile` are expected):
+     ```sh
+     luau-analyze --mode=nonstrict fiu_main.lua 2>&1 | grep -oE "Unknown global '[^']+'" | sort | uniq -c
+     ```
+     Fix it by publishing the table on `HOOK` (as `HOOK.STAFF = STAFF`) and reading it through `HOOK` above the declaration.
 2. **Never hold a car instance across a wait.** A respawn, or the car streaming out while you're at the store, swaps the instance in `workspace.Vehicles`, and the old one loses its children: indexing it throws "Values / Body is not a valid member of Model". Read the car through `HOOK.carNow(e, timeout)` (the current instance once `Values.Engine.Wear` exist) or `carOf(e)` at each step, and use `FindFirstChild` on anything under it.
 3. **Multiple accounts share one executor workspace.** Any state that belongs to one account must go in a file named with its `LP.UserId`. A shared file lets one account overwrite another's data; this caused real bugs, now fixed.
 4. **No in-game test from the cloud.** Code was written against the measured mechanics below. Anything marked *untested* needs an in-game check.
