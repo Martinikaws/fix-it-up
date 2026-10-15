@@ -988,7 +988,8 @@ function HOOK.repairRaw(e)
         until hoodOpen() or os.clock() - t > 10
     end
     -- some cars have no hood at all (the Skami Truk's Misc is empty): their engine is reachable without one
-    if cd and not hoodOpen() then return false, "couldn't open the hood" end
+    if cd and not hoodOpen() then HOOK.deadNote("hood"); return false, "couldn't open the hood" end
+    if cd then HOOK.deadOk() end -- the server answered the click
 
     -- slots to pull: installed, worn, and either repairable or replaceable
     car = HOOK.carNow(e, 5)
@@ -1323,16 +1324,28 @@ local function sellCar(e, manual)
     local left = sellCooldownLeft(e)
     if left > 0 then return false, ("sell timer: %dm %02ds"):format(left // 60, left % 60) end
     local npc = workspace.Utils.SellCar
+    local backMe = hrp() and hrp().CFrame -- afterwards you go back where you were (sold or not)
     streamAt(npc:GetPivot().Position, 5)
     local pr = npc:FindFirstChild("Prompt") or npc:WaitForChild("Prompt", 5)
-    if not pr then return false, "sell NPC not loaded" end
+    if not pr then
+        -- the streaming request can go unanswered (2026-10-15: "sell NPC not loaded" on every try): standing at the NPC
+        -- streams it in without asking the server
+        tpTo(CFrame.new(npc:GetPivot().Position + Vector3.new(0, 3, 10)))
+        pr = npc:WaitForChild("Prompt", 8)
+        if not pr then
+            HOOK.deadNote("sell prompt")
+            if backMe then tpTo(backMe) end
+            return false, "sell NPC not loaded"
+        end
+    end
     -- the prompt sells whatever car is in the zone: never with another of your cars there
     for _, o in ipairs(entries()) do
         local c = carOf(o)
-        if o ~= e and c and (c:GetPivot().Position - pr.Position).Magnitude < 40 then return false, entryModel(o) .. " is parked at the sell zone, move it first" end
+        if o ~= e and c and (c:GetPivot().Position - pr.Position).Magnitude < 40 then
+            if backMe then tpTo(backMe) end
+            return false, entryModel(o) .. " is parked at the sell zone, move it first"
+        end
     end
-    -- afterwards you go back where you were (sold or not)
-    local backMe = hrp() and hrp().CFrame
     local function back(...)
         confirmFn = nil
         if backMe then tpTo(backMe) end
@@ -1369,6 +1382,7 @@ local function sellCar(e, manual)
                 if o and o.boughtAt then pcall(HOOK.LED.add, want, offer - cost - partsCost, (os.time() - o.boughtAt) / 60, offer) end
             end
             saveState()
+            HOOK.deadOk()
             return back(true, ("sold %s for %s"):format(want, money(offer)))
         end
         if lastNotify.t >= nt0 then
@@ -1456,6 +1470,7 @@ local function buyJunk(info, opts)
         repeat task.wait(0.1) until asked or os.clock() - t > 2.5
         if asked then break end
     end
+    if asked then HOOK.deadOk() end -- the server offered it
     local new
     if yes then
         local t = os.clock()
@@ -1476,7 +1491,7 @@ local function buyJunk(info, opts)
         HOOK.pendTag(pendAt, new.Name, OWNED[new.Name].boughtAt)
         return new, ("bought %s for %s%s"):format(entryModel(new), money(price), sniped and " · sniped from a player at it" or "")
     end
-    if not asked then return nil, "the server never offered the car (someone else bought it, or you're too far)" end
+    if not asked then HOOK.deadNote("buy offer"); return nil, "the server never offered the car (someone else bought it, or you're too far)" end
     if not yes then
         if price and price > max then return nil, ("price went up: %s"):format(money(price)) end
         return nil, ("declined at %s"):format(money(price))
