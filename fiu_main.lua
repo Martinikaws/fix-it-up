@@ -160,6 +160,8 @@ local CFG = {
     sellCooldown = 0, -- seconds; 0 = learn it from the server's refusal
     bringCar = false, walkSpeed = 16, speedOn = false, antiAfk = true,
     wdOn = true, wdMins = 10, wdHop = true, -- auto flip stuck watchdog
+    buyOrder = "Rarest first", -- or "Best € per minute" (flip ledger)
+    perfLow = false, perfFps = 0, perfMute = false, -- Settings > Performance
     cleanAfter = false, paintAfter = false, paintRandom = false, paintMaterial = "Normal", paintColor = Color3.fromRGB(30, 90, 220),
     homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucNonStop = false, aucSellJunk = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
     driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmResume = true, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
@@ -1137,6 +1139,65 @@ end
 
 local function paintColor() return CFG.paintRandom and Color3.fromHSV(math.random(), 0.75, 0.9) or CFG.paintColor end
 
+-- ============================== flip ledger ==============================
+-- Per model: flips sold, total profit, total minutes from buy to sale (how long the car held a garage slot, which is
+-- what limits the loop when the garage is full). Written per account (ledger_<UserId>.json); the rates merge every
+-- account's file read-only, so all your accounts learn from each other's sales. The "Best € per minute" buy order uses it.
+HOOK.LED = { file = ("%s/ledger_%d.json"):format(DIR, LP.UserId), all = {}, at = 0 }
+HOOK.LED.mine = readJSON(HOOK.LED.file, {})
+function HOOK.LED.add(model, profit, mins, revenue)
+    local L = HOOK.LED
+    local r = L.mine[model] or { n = 0, profit = 0, mins = 0, revenue = 0 }
+    r.n, r.profit, r.mins, r.revenue = r.n + 1, r.profit + profit, r.mins + math.max(1, mins), r.revenue + (revenue or 0)
+    L.mine[model] = r
+    writeJSON(L.file, L.mine)
+    L.at = 0 -- re-merge on the next read
+end
+function HOOK.LED.merged()
+    local L = HOOK.LED
+    if os.clock() - L.at < 300 and L.at > 0 then return L.all end
+    local all = {}
+    local function addAll(t)
+        for m, r in pairs(type(t) == "table" and t or {}) do
+            if type(r) == "table" and tonumber(r.n) then
+                local a = all[m] or { n = 0, profit = 0, mins = 0, revenue = 0 }
+                a.n, a.profit = a.n + r.n, a.profit + (tonumber(r.profit) or 0)
+                a.mins, a.revenue = a.mins + (tonumber(r.mins) or 0), a.revenue + (tonumber(r.revenue) or 0)
+                all[m] = a
+            end
+        end
+    end
+    local ok, files = pcall(listfiles, DIR)
+    local mineSeen = false
+    for _, f in ipairs(ok and type(files) == "table" and files or {}) do
+        local name = tostring(f):match("[^/\\]+$") or ""
+        if name:match("^ledger_%d+%.json$") then
+            if name == ("ledger_%d.json"):format(LP.UserId) then mineSeen = true; addAll(L.mine) else addAll(readJSON(DIR .. "/" .. name, {})) end
+        end
+    end
+    if not mineSeen then addAll(L.mine) end
+    L.all, L.at = all, os.clock()
+    return all
+end
+-- € per minute held for a model, or nil with fewer than 2 sales
+function HOOK.LED.rate(model)
+    local r = HOOK.LED.merged()[model]
+    return r and r.n >= 2 and r.mins > 0 and r.profit / r.mins or nil
+end
+-- for a junkyard car (its name can match several models): the best learned rate, else its mid catalog profit over the
+-- average minutes a flip has taken so far (30 before anything has sold)
+function HOOK.LED.est(j)
+    local best
+    for _, n in ipairs(j.names or {}) do
+        local r = HOOK.LED.rate(n)
+        if r and (not best or r > best) then best = r end
+    end
+    if best then return best end
+    local n, mins = 0, 0
+    for _, r in pairs(HOOK.LED.merged()) do n, mins = n + r.n, mins + r.mins end
+    return ((j.profitLo or 0) + (j.profitHi or 0)) / 2 / (n > 0 and mins / n or 30)
+end
+
 -- ============================== sell ==============================
 local function sellCar(e, manual)
     if isFav(e) then return false, "locked: " .. entryModel(e) .. " is a favorite" end
@@ -1187,6 +1248,7 @@ local function sellCar(e, manual)
             if offer and cost > 0 then
                 STATE.profit = (STATE.profit or 0) + offer - cost - partsCost
                 STATE.profitSales = (STATE.profitSales or 0) + 1
+                if o and o.boughtAt then pcall(HOOK.LED.add, want, offer - cost - partsCost, (os.time() - o.boughtAt) / 60, offer) end
             end
             saveState()
             return back(true, ("sold %s for %s"):format(want, money(offer)))
@@ -1583,7 +1645,7 @@ end
 HOOK.WH = readJSON(DIR .. "/webhook.json", {})
 do
     local d = { url = "", spawns = true, spawnMin = "A", exclusive = true, pingMin = "S", pingId = "",
-        moneyOn = false, every = 30, group = true }
+        moneyOn = false, every = 30, group = true, offlineAlert = true, summaryOn = true }
     for k, v in pairs(d) do if HOOK.WH[k] == nil then HOOK.WH[k] = v end end
 end
 HOOK.WH.q, HOOK.WH.status = {}, "idle"
@@ -1775,6 +1837,72 @@ task.spawn(function() -- heartbeat
     end
 end)
 
+-- offline alert: the leader (lowest live UserId) posts the moment another account stops writing its heartbeat, and
+-- again when it's back. The account that dropped can't say so itself (its own rejoin posts separately). A new leader
+-- that never saw an account live still reports it if it went quiet in the last few minutes.
+task.spawn(function()
+    local W = HOOK.WH
+    local seen = {} -- uid -> live, as this leader last saw it
+    while running and getgenv().FIU_TOKEN == HOOK.token do
+        task.wait(30)
+        if W.group and W.offlineAlert and W.valid(W.url) then
+            local ok, states = pcall(W.states)
+            if ok and W.leader(states) then
+                local now = os.time()
+                for uid, st in pairs(states) do
+                    local age = now - (tonumber(st.ts) or 0)
+                    local live = age <= W.STALE
+                    if uid ~= LP.UserId then
+                        local went = not live and (seen[uid] == true or (seen[uid] == nil and age <= W.STALE + 240))
+                        local back = live and seen[uid] == false
+                        if went or back then
+                            W.push({ content = W.pingId ~= "" and went and ("<@" .. W.pingId .. ">") or nil,
+                                allowed_mentions = W.pingId ~= "" and { users = { W.pingId } } or { parse = {} },
+                                embeds = { { title = went and ("⚫ %s went offline"):format(tostring(st.name)) or ("🟢 %s is back online"):format(tostring(st.name)),
+                                    description = ("money %s%s"):format(money(tonumber(st.money) or 0), went and (" · last heartbeat %ds ago"):format(age) or ""),
+                                    color = went and 0xe0233c or 0x10b981 } } })
+                        end
+                    end
+                    seen[uid] = live
+                end
+            end
+        end
+    end
+end)
+
+-- session summary: when this account hops / rejoins (the teleport starts) or you press Unload, one post with what the
+-- session did. Skipped for sessions under 5 minutes, so an auto hop hunt doesn't post every 15 seconds.
+HOOK.WH.sess = { t0 = os.time(), m0 = myMoney(), sold0 = STATE.sold or 0, profit0 = STATE.profit or 0 }
+function HOOK.WH.summary(why)
+    local W, s = HOOK.WH, HOOK.WH.sess
+    if s.sent or not (W.summaryOn and W.valid(W.url)) then return end
+    local secs = os.time() - s.t0
+    if secs < 300 then return end
+    s.sent = true
+    local d = myMoney() - s.m0
+    local fields = {
+        { name = "Time", value = ("%dh %02dm"):format(secs // 3600, secs % 3600 // 60), inline = true },
+        { name = "Money", value = ("%s%s (%s/h)"):format(d >= 0 and "+" or "-", money(math.abs(d)), money(math.floor(d / (secs / 3600)))), inline = true },
+        { name = "Flips sold", value = tostring((STATE.sold or 0) - s.sold0), inline = true },
+        { name = "Flip profit", value = money((STATE.profit or 0) - s.profit0), inline = true },
+    }
+    local dr = W.drive()
+    if dr and s.km0 then fields[#fields + 1] = { name = "Km driven", value = ("%.2f km"):format(dr.km - s.km0), inline = true } end
+    if HOOK.candy and HOOK.candy.got > 0 then fields[#fields + 1] = { name = "Candy", value = tostring(HOOK.candy.got), inline = true } end
+    if HOOK.WD and HOOK.WD.fires > 0 then fields[#fields + 1] = { name = "Watchdog", value = tostring(HOOK.WD.fires), inline = true } end
+    task.spawn(W.post, { username = "Martini Hub", allowed_mentions = { parse = {} }, embeds = { {
+        title = ("Session summary (%s)"):format(why), color = 0x10b981, fields = fields, timestamp = DateTime.now():ToIsoDate(),
+        footer = { text = ("Martini Hub · %s · server %s"):format(LP.Name, game.JobId:sub(1, 8)) } } } })
+end
+on(LP.OnTeleport, function(st) if st == Enum.TeleportState.Started then pcall(HOOK.WH.summary, "server change") end end)
+task.spawn(function() -- km at the start, once the Drive tab can tell it
+    while running and not HOOK.WH.sess.km0 do
+        local dr = HOOK.WH.drive()
+        if dr then HOOK.WH.sess.km0 = dr.km end
+        task.wait(5)
+    end
+end)
+
 task.spawn(function() -- periodic money report
     local nextAt = os.clock() + 60 -- first one a minute after load, then every HOOK.WH.every minutes
     while running and getgenv().FIU_TOKEN == HOOK.token do
@@ -1814,7 +1942,16 @@ local function wantedJunk()
     local best, taken = nil, 0 -- taken = matching cars left to players standing at them
     -- rarest first by the real spawn chance (tiers are too coarse: a 0.2% A beats a 0.9% A), then profit
     local list = sortedJunk()
+    -- "Best € per minute": S tier and rarer still first (worth more than any rate, and players race for them), then
+    -- the flip ledger's real € per minute held; a model with < 2 sales is estimated from its catalog profit
+    local byRate = CFG.buyOrder == "Best € per minute"
+    if byRate then for _, j in ipairs(list) do j.est = HOOK.LED.est(j) end end
     table.sort(list, function(a, b)
+        if byRate then
+            local ra, rb = (TIER_RANK[a.tier] or 9) <= TIER_RANK.S, (TIER_RANK[b.tier] or 9) <= TIER_RANK.S
+            if ra ~= rb then return ra end
+            if not ra and a.est ~= b.est then return a.est > b.est end
+        end
         local sa, sb = a.sc or 100, b.sc or 100
         if sa ~= sb then return sa < sb end
         return a.profitHi > b.profitHi
@@ -2596,6 +2733,7 @@ local function unload()
     if getgenv().FIU_MAIN and getgenv().FIU_MAIN.unload == unload then getgenv().FIU_MAIN = nil end -- not a newer copy's export
     running = false
     pcall(RunService.Set3dRenderingEnabled, RunService, true) -- never leave the world black after unload
+    if HOOK.PERF then pcall(HOOK.PERF.restore) end -- graphics, FPS cap, volume back
     pcall(function() if HOOK.statsGui then HOOK.statsGui:Destroy(); HOOK.statsGui = nil end end)
     if HOOK.TR then pcall(HOOK.TR.restore) end -- traffic back, collisions back
     if HOOK.road then pcall(HOOK.road.Destroy, HOOK.road); HOOK.road = nil end
@@ -3303,6 +3441,35 @@ Filt:AddDropdown("FIU_BuyModels", { Text = "Only these models", Tooltip = "None 
 Filt:AddSlider("FIU_BuyMax", { Text = "Max price", Default = CFG.buyMaxPrice, Min = 1000, Max = 500000, Rounding = 0, Suffix = "€", Callback = set("buyMaxPrice") })
 Filt:AddSlider("FIU_BuyProfit", { Text = "Min profit", Default = CFG.buyMinProfit, Min = 0, Max = 100000, Rounding = 0, Suffix = "€",
     Tooltip = "Profit = price x profit multiplier (sale at 100% condition)", Callback = set("buyMinProfit") })
+Filt:AddDropdown("FIU_BuyOrder", { Text = "When several match, buy", Values = { "Rarest first", "Best € per minute" }, Default = CFG.buyOrder,
+    Tooltip = "Best € per minute: S tier and rarer still first, then the model that earned the most per minute it held a garage slot "
+        .. "(Flip ledger, all your accounts). Models with fewer than 2 sales are estimated from their catalog profit.",
+    Callback = set("buyOrder") })
+
+do
+    local led = Tabs.Auto:AddRightGroupbox("Flip ledger", "book-open")
+    led:AddLabel("Real results per model from every sale (all your accounts): profit, and minutes from buy to sale.", true)
+    local ledLabel = led:AddLabel("-", true)
+    function HOOK.LED.show()
+        local rows = {}
+        for m, r in pairs(HOOK.LED.merged()) do rows[#rows + 1] = { m = m, r = r, rate = r.mins > 0 and r.profit / r.mins or 0 } end
+        table.sort(rows, function(a, b) return a.rate > b.rate end)
+        local lines = {}
+        for i = 1, math.min(10, #rows) do
+            local x = rows[i]
+            lines[#lines + 1] = ("%s · %d flip%s · avg %s · %dm held · %s/min"):format(x.m, x.r.n, x.r.n == 1 and "" or "s",
+                money(x.r.profit / x.r.n), math.floor(x.r.mins / x.r.n + 0.5), money(math.floor(x.rate)))
+        end
+        if #rows > 10 then lines[#lines + 1] = ("... %d more models"):format(#rows - 10) end
+        pcall(ledLabel.SetText, ledLabel, #lines > 0 and table.concat(lines, "\n") or "No sales recorded yet. Each sale by auto flip or the Sell button adds a line.")
+    end
+    led:AddButton({ Text = "Refresh", Func = function() HOOK.LED.at = 0; HOOK.LED.show() end })
+    led:AddButton({ Text = "Reset this account's ledger", DoubleClick = true, Func = function()
+        HOOK.LED.mine = {}; writeJSON(HOOK.LED.file, {}); HOOK.LED.at = 0; HOOK.LED.show()
+    end })
+    HOOK.LED.show()
+    task.spawn(function() while running do task.wait(60); pcall(HOOK.LED.show) end end)
+end
 
 local Timer = Tabs.Auto:AddRightGroupbox("Sell timer", "timer")
 Timer:AddLabel("The server refuses to sell a car for a while after you buy it. 0 = learn it from the first refusal (saved).", true)
@@ -4674,7 +4841,7 @@ do
         :AddKeyPicker("FIU_StatsKey", { Default = skey, Mode = "Toggle", SyncToggleState = true, Text = "Stats screen",
             ChangedCallback = function(k) pcall(HOOK.keySave, "stats", k) end })
 end
-Menu:AddButton({ Text = "Unload", Func = function() Library:Unload() end })
+Menu:AddButton({ Text = "Unload", Func = function() pcall(HOOK.WH.summary, "unloaded"); Library:Unload() end })
 end
 Library:OnUnload(unload)
 do
@@ -4717,6 +4884,12 @@ MoBox:AddSlider("FIU_WhEvery", { Text = "Every", Default = HOOK.WH.every, Min = 
 MoBox:AddToggle("FIU_WhGroup", { Text = "Group all my accounts", Default = HOOK.WH.group,
     Tooltip = "Run this script on every account: one combined report (sent by the account with the lowest UserId), and one spawn alert per server",
     Callback = function(v) HOOK.WH.group = v; HOOK.WH.save(); if v then pcall(HOOK.WH.beat) end end })
+MoBox:AddToggle("FIU_WhOffline", { Text = "Alert when an account goes offline", Default = HOOK.WH.offlineAlert,
+    Tooltip = "Needs Group all my accounts. Posts (and pings your ID, if set) when one of your accounts stops running the script, and when it's back.",
+    Callback = function(v) HOOK.WH.offlineAlert = v; HOOK.WH.save() end })
+MoBox:AddToggle("FIU_WhSummary", { Text = "Session summary on hop / unload", Default = HOOK.WH.summaryOn,
+    Tooltip = "One post when this account changes server or you press Unload: time, money, flips, profit, km. Not for sessions under 5 min.",
+    Callback = function(v) HOOK.WH.summaryOn = v; HOOK.WH.save() end })
 MoBox:AddButton({ Text = "Send money now", Func = function()
     local ok
     if HOOK.WH.group then ok = HOOK.WH.moneyAll(true) else ok = HOOK.WH.money(true) end
@@ -4820,6 +4993,65 @@ end
 task.spawn(function()
     while running do guard("traffic", TR.tick); task.wait(3) end
 end)
+
+-- ============================== performance ==============================
+-- For running many accounts: lowest graphics, an FPS cap and mute, on this client only and undone on unload.
+-- Mute sets Roblox's master volume, which Roblox saves: the old value goes to FixItUp/volume.json first and is put
+-- back when mute goes off, on unload, or on the next load after a crash. (Zeroing each Sound doesn't hold: the car
+-- chassis scripts set their engine volume every frame.)
+do
+    local P = { file = DIR .. "/volume.json" }
+    HOOK.PERF = P
+    function P.quality(low)
+        if low then
+            if P.q == nil then
+                pcall(function() P.q = settings().Rendering.QualityLevel end)
+                pcall(function() P.shadows = game:GetService("Lighting").GlobalShadows end)
+            end
+            pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+            pcall(function() game:GetService("Lighting").GlobalShadows = false end)
+        elseif P.q ~= nil then
+            pcall(function() settings().Rendering.QualityLevel = P.q end)
+            pcall(function() game:GetService("Lighting").GlobalShadows = P.shadows end)
+            P.q = nil
+        end
+    end
+    function P.fps(n)
+        local f = setfpscap or (syn and syn.setfpscap)
+        if type(f) ~= "function" then return false end
+        if n > 0 then pcall(f, n); P.capped = true
+        elseif P.capped then pcall(f, 60); P.capped = false end -- back to Roblox's default
+        return true
+    end
+    function P.mute(on)
+        local ok = pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            local saved = readJSON(P.file, nil)
+            if on then
+                if not saved and ugs.MasterVolume > 0 then writeJSON(P.file, { volume = ugs.MasterVolume }) end
+                ugs.MasterVolume = 0
+            elseif saved then
+                ugs.MasterVolume = tonumber(saved.volume) or 1
+                pcall(delfile, P.file)
+            end
+        end)
+        return ok
+    end
+    function P.restore()
+        P.quality(false); P.fps(0); P.mute(false)
+    end
+    P.mute(false) -- a crash while muted left the saved volume behind: put it back (the config turns mute on again if wanted)
+    local box = Tabs.Settings:AddLeftGroupbox("Performance", "cpu")
+    box:AddLabel("For running many accounts. Only this client, and everything is undone on unload.", true)
+    box:AddToggle("FIU_PerfLow", { Text = "Lowest graphics, no shadows", Default = CFG.perfLow,
+        Callback = function(v) CFG.perfLow = v; P.quality(v) end })
+    local hasCap = type(setfpscap or (syn and syn.setfpscap)) == "function"
+    box:AddSlider("FIU_PerfFps", { Text = "FPS cap (0 = off)", Default = CFG.perfFps, Min = 0, Max = 240, Rounding = 0,
+        Tooltip = hasCap and "15-30 is plenty for farming AFK" or "This executor has no setfpscap", Callback = function(v) CFG.perfFps = v; P.fps(v) end })
+    box:AddToggle("FIU_PerfMute", { Text = "Mute game sound", Default = CFG.perfMute,
+        Callback = function(v) CFG.perfMute = v; if not P.mute(v) and v then notify("This executor can't change Roblox's volume") end end })
+    if not hasCap then box:AddLabel("FPS cap: not available on this executor (no setfpscap).", true) end
+end
 
 local World = Tabs.Settings:AddLeftGroupbox("Traffic", "car-front")
 World:AddToggle("FIU_NoTraffic", { Text = "Disable traffic", Default = true,
@@ -5196,7 +5428,7 @@ SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 -- a config is the WHOLE menu: every toggle (distance farm, auto hop, gold contract included), slider, dropdown, input
 -- and color is saved and loaded. Nothing is excluded (user, 2026-10-01: "the configs will save the configuration of the menu").
-SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_Stats", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
+SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_Stats", "FIU_WhGroup", "FIU_WhOffline", "FIU_WhSummary", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
 -- Martini Hub look: dark graphite with an emerald accent, Gotham font (still switchable under Settings > Themes)
