@@ -159,6 +159,7 @@ local CFG = {
     repairMin = 1, replaceWorn = true, replaceNoReserve = true, station = "Dealership",
     sellCooldown = 0, -- seconds; 0 = learn it from the server's refusal
     bringCar = false, walkSpeed = 16, speedOn = false, antiAfk = true,
+    wdOn = true, wdMins = 10, wdHop = true, -- auto flip stuck watchdog
     cleanAfter = false, paintAfter = false, paintRandom = false, paintMaterial = "Normal", paintColor = Color3.fromRGB(30, 90, 220),
     homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucNonStop = false, aucSellJunk = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
     driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmResume = true, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
@@ -835,7 +836,7 @@ local INSTALL_FIRST = { EngineBlock = 1 }
 -- Never hold one car instance across a wait: a respawn or the car streaming out swaps it (see HOOK.carNow), so every
 -- step below reads the current one.
 function HOOK.repairRaw(e)
-    HOOK.repairParts = nil
+    HOOK.repairParts, HOOK.repairEntry = nil, e
     log(("repairing %s at %s"):format(entryModel(e), ST.name()))
     tpTo(liftCF() * CFrame.new(0, 0, 12)) -- be there first so the car streams in with you
     if not spawnCar(e, liftCF()) then return false, "spawn failed" end
@@ -2644,18 +2645,106 @@ task.spawn(function() -- players move: their labels refresh 4x a second (positio
         task.wait(0.25)
     end
 end)
-task.spawn(function()
-    while running do
+-- a named loop with a generation number, so the stuck watchdog below can stop a hung run and start a fresh one
+HOOK.WD = { gen = 1, errs = 0, fires = 0, status = "watching" }
+function HOOK.autoLoop(gen)
+    while running and gen == HOOK.WD.gen do
         if STAFF.gated() then autoStatus = "blocked: " .. STAFF.gateMsg
         elseif CFG.autoBuy or CFG.autoRepair or CFG.autoSell then
             -- autoStep only runs when nothing is busy and it's the only thing that set busy: if it errors mid-job,
             -- clear it, or one crash leaves auto frozen on "busy" for the rest of the session
-            if not guard("auto", autoStep) then busy, confirmFn = false, nil end
+            HOOK.WD.stepAt = os.clock()
+            local ok = guard("auto", autoStep)
+            if gen ~= HOOK.WD.gen then return end -- the watchdog replaced this run while it hung
+            HOOK.WD.stepAt = nil
+            if ok then HOOK.WD.errs, HOOK.WD.errAt = 0, nil
+            else
+                busy, confirmFn = false, nil
+                HOOK.WD.errs += 1; HOOK.WD.errAt = HOOK.WD.errAt or os.clock()
+            end
         else autoStatus = "off" end
         -- every 2 s, or at once when the distance farm hands over (CONTEST.wake)
         local t = os.clock()
         repeat task.wait(0.1) until CONTEST.wake or os.clock() - t > 2
         CONTEST.wake = false
+    end
+end
+HOOK.WD.thread = task.spawn(HOOK.autoLoop, HOOK.WD.gen)
+
+-- ============================== stuck watchdog ==============================
+-- Auto flip has no other way out of two kinds of stuck: one step that never returns (a server call that never
+-- answers, a wait without a timeout) and the same error every 2 s. First time: stop the run, put back any parts it
+-- had pulled, reset the character (clears a stuck seat or tool) and start auto again. Stuck again within 30 min:
+-- the server is the likely problem, so hop (like a keyword hop), or rejoin when no server is found. An error loop never
+-- hops (a new server doesn't fix a script error) and gives up after 3 resets, so it can't reset every few minutes forever.
+function HOOK.wdFire(why, hang)
+    local W = HOOK.WD
+    local again = W.lastFire ~= nil and os.clock() - W.lastFire < 1800
+    W.lastFire, W.fires = os.clock(), W.fires + 1
+    local hopIt = hang and again and CFG.wdHop
+    local action = hopIt and "hopping to another server" or "resetting auto flip"
+    W.status = ("%s · %s · %s"):format(os.date("%H:%M"), why, action)
+    lifeLog("watchdog: " .. why .. " -> " .. action)
+    log("stuck: " .. why)
+    pcall(notify, ("Auto flip stuck (%s): %s"):format(why, action))
+    pcall(function()
+        local WH = HOOK.WH
+        if WH and WH.valid(WH.url) then
+            WH.push({ allowed_mentions = { parse = {} }, embeds = { { title = "Auto flip stuck", description = why, color = 0xe67e22,
+                fields = { { name = "Action", value = action, inline = true }, { name = "This session", value = tostring(W.fires), inline = true } } } } })
+        end
+    end)
+    -- stop the hung run and clean up what it held
+    W.gen += 1
+    if W.thread then pcall(task.cancel, W.thread) end
+    W.stepAt, W.errs, W.errAt = nil, 0, nil
+    if HOOK.repairPin then pcall(function() HOOK.repairPin:Disconnect() end); HOOK.repairPin = nil end
+    if HOOK.repairEntry and HOOK.repairParts then
+        for _ = 1, 2 do
+            for _, p in ipairs(HOOK.repairParts) do
+                if p.Parent == MoveParts then fireParts(HOOK.repairEntry, "ReapplyPart", p); task.wait(0.3) end
+            end
+            task.wait(0.8)
+        end
+    end
+    HOOK.repairParts = nil
+    busy, busyWhat, confirmFn = false, nil, nil
+    local h = hum()
+    if h then pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Seated, true); h.Health = 0 end) end
+    if hopIt then
+        task.spawn(function()
+            STAFF.leaving = true -- nothing new starts while we look for a server
+            local ok = STAFF.hopOnce()
+            if running and not ok then pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LP); task.wait(15) end
+            STAFF.leaving = false
+        end)
+    end
+    task.wait(6) -- respawn
+    if running then W.thread = task.spawn(HOOK.autoLoop, W.gen) end
+end
+task.spawn(function()
+    while running do
+        task.wait(5)
+        local W = HOOK.WD
+        local limit = (CFG.wdMins or 10) * 60
+        local why
+        local hang = false
+        if CFG.wdOn and (CFG.autoBuy or CFG.autoRepair or CFG.autoSell) then
+            if W.stepAt and os.clock() - W.stepAt > limit then
+                why, hang = ("no progress for %d min while %s"):format(math.floor((os.clock() - W.stepAt) / 60), tostring(busyWhat or autoStatus)), true
+            elseif W.errs >= 10 and W.errAt and os.clock() - W.errAt > math.min(limit, 180) then
+                if (W.errResets or 0) < 3 then
+                    W.errResets = (W.errResets or 0) + 1
+                    why = ("%d errors in a row: %s"):format(W.errs, tostring(errs.auto):sub(1, 120))
+                elseif not W.gaveUp then
+                    W.gaveUp = true
+                    W.status = os.date("%H:%M") .. " · the same error keeps coming back after 3 resets: watchdog stopped resetting. Send errors.txt."
+                    lifeLog("watchdog: gave up on an error loop: " .. tostring(errs.auto))
+                    pcall(notify, "Auto flip keeps failing with the same error; the watchdog stopped resetting it")
+                end
+            end
+        end
+        if why then pcall(HOOK.wdFire, why, hang) end
     end
 end)
 
@@ -3168,6 +3257,25 @@ HomeBox:AddButton({ Text = "Go home", Func = function()
 end })
 HomeBox:AddButton({ Text = "Clear home", DoubleClick = true, Func = function() STATE.home = nil; saveState(); showHome() end })
 showHome()
+end
+
+do
+local wd = Tabs.Auto:AddLeftGroupbox("Stuck watchdog", "shield-check")
+wd:AddLabel("If one auto step runs longer than the time below, or fails with the same error over and over, it stops the run, "
+    .. "puts back any parts it had pulled, resets your character and starts auto again. Stuck again within 30 min: hops to another server.", true)
+wd:AddToggle("FIU_WdOn", { Text = "Stuck watchdog", Default = CFG.wdOn, Callback = set("wdOn") })
+wd:AddSlider("FIU_WdMins", { Text = "Stuck after", Default = CFG.wdMins, Min = 5, Max = 30, Rounding = 0, Suffix = " min", Callback = set("wdMins") })
+wd:AddToggle("FIU_WdHop", { Text = "Hop if it gets stuck again", Default = CFG.wdHop,
+    Tooltip = "Only for a step that never finishes; an error loop just resets (a new server doesn't fix a script error)", Callback = set("wdHop") })
+local wdLabel = wd:AddLabel("-", true)
+task.spawn(function()
+    while running do
+        local W = HOOK.WD
+        local cur = W.stepAt and ("current step: %ds"):format(math.floor(os.clock() - W.stepAt)) or "idle"
+        pcall(wdLabel.SetText, wdLabel, ("%s · fired %d time(s)\n%s"):format(cur, W.fires, W.status))
+        task.wait(1)
+    end
+end)
 end
 
 do
