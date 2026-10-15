@@ -2591,6 +2591,7 @@ local function unload()
     if getgenv().FIU_MAIN and getgenv().FIU_MAIN.unload == unload then getgenv().FIU_MAIN = nil end -- not a newer copy's export
     running = false
     pcall(RunService.Set3dRenderingEnabled, RunService, true) -- never leave the world black after unload
+    pcall(function() if HOOK.statsGui then HOOK.statsGui:Destroy(); HOOK.statsGui = nil end end)
     if HOOK.TR then pcall(HOOK.TR.restore) end -- traffic back, collisions back
     if HOOK.road then pcall(HOOK.road.Destroy, HOOK.road); HOOK.road = nil end
     for _, c in ipairs(conns) do pcall(c.Disconnect, c) end
@@ -4659,6 +4660,14 @@ do
         Callback = function(v) pcall(RunService.Set3dRenderingEnabled, RunService, not v) end })
         :AddKeyPicker("FIU_NoRenderKey", { Default = rkey, Mode = "Toggle", SyncToggleState = true, Text = "Disable 3D rendering",
             ChangedCallback = function(k) pcall(HOOK.keySave, "render", k) end })
+
+    -- stats screen (HOOK.statsShow, built near the end of the script): world off, a full-screen panel with every stat
+    local skey = HOOK.keyName(readJSON(DIR .. "/menukey.json", {}).stats) or "F6"
+    Menu:AddToggle("FIU_Stats", { Text = "Stats screen", Default = false,
+        Tooltip = "Hides the game behind a gray screen with all your stats (3D rendering off, so it saves GPU too). The menu still opens on top.",
+        Callback = function(v) pcall(HOOK.statsShow, v) end })
+        :AddKeyPicker("FIU_StatsKey", { Default = skey, Mode = "Toggle", SyncToggleState = true, Text = "Stats screen",
+            ChangedCallback = function(k) pcall(HOOK.keySave, "stats", k) end })
 end
 Menu:AddButton({ Text = "Unload", Func = function() Library:Unload() end })
 end
@@ -4845,6 +4854,7 @@ do
 -- jars already in Halloween2 and stops once all are done, instead of re-clicking every 5 min.
 -- The NAME-based path (words below) is only a fallback for if the Event folder is ever gone.
 local CANDY = { on = false, status = "off", got = 0, skip = {}, words = "candy" }
+HOOK.candy = CANDY -- for the stats screen
 HOOK.CANDY = CANDY
 -- PlayerData.Cache.Halloween2: our saved record of which Event jars we've collected (one StringValue per slot number)
 function CANDY.h2()
@@ -5181,7 +5191,7 @@ SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 -- a config is the WHOLE menu: every toggle (distance farm, auto hop, gold contract included), slider, dropdown, input
 -- and color is saved and loaded. Nothing is excluded (user, 2026-10-01: "the configs will save the configuration of the menu").
-SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
+SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_Stats", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
 -- Martini Hub look: dark graphite with an emerald accent, Gotham font (still switchable under Settings > Themes)
@@ -5570,6 +5580,7 @@ do
     HOOK.driveNumbers = numbers -- for the webhook reports
 
     local farm = { on = false, status = "off", startKm = 0 }
+    HOOK.farm = farm -- for the stats screen
     -- route: back and forth along the city's longest straight road (the traffic lanes run on a far-off highway)
     local function roadRoute()
         local best
@@ -6181,6 +6192,128 @@ task.spawn(function()
     end
 end)
 
+-- ============================== stats screen ==============================
+-- Settings > Menu > Stats screen (or its key, F6 by default): 3D rendering off like "Disable 3D rendering", but instead
+-- of the blank screen a full-screen panel in the theme's gray with every stat, refreshed each second. It sits under the
+-- menu (DisplayOrder 900 < Obsidian's 998), so the menu still opens on top. Rebuilt on every show so it follows the theme.
+do
+    local S = { t0 = os.clock(), m0 = myMoney() }
+    function S.dur(s)
+        s = math.max(0, math.floor(s))
+        return s >= 3600 and ("%dh %02dm"):format(s // 3600, s % 3600 // 60) or ("%dm %02ds"):format(s // 60, s % 60)
+    end
+    function S.text(parent, font, size, color, alpha, pos, sz)
+        local t = Instance.new("TextLabel")
+        t.BackgroundTransparency, t.Font, t.TextSize, t.TextColor3, t.TextTransparency = 1, font, size, color, alpha or 0
+        t.TextXAlignment, t.TextYAlignment, t.TextTruncate = Enum.TextXAlignment.Left, Enum.TextYAlignment.Top, Enum.TextTruncate.AtEnd
+        t.Position, t.Size, t.Text, t.Parent = pos, sz, "", parent
+        return t
+    end
+    function S.build()
+        local sc = Library.Scheme
+        local gray, panel, line, fg, accent = sc.MainColor, sc.BackgroundColor, sc.OutlineColor, sc.FontColor, sc.AccentColor
+        local gui = Instance.new("ScreenGui")
+        gui.Name, gui.IgnoreGuiInset, gui.ResetOnSpawn, gui.DisplayOrder, gui.ZIndexBehavior = "FIU_Stats", true, false, 900, Enum.ZIndexBehavior.Sibling
+        local bg = Instance.new("Frame")
+        bg.Size, bg.BackgroundColor3, bg.BorderSizePixel, bg.Active, bg.Parent = UDim2.fromScale(1, 1), gray, 0, true, gui
+        local grad = Instance.new("UIGradient")
+        grad.Rotation, grad.Color, grad.Parent = 90, ColorSequence.new(gray, gray:Lerp(panel, 0.6)), bg
+        local box = Instance.new("Frame")
+        box.AnchorPoint, box.Position, box.Size, box.BackgroundTransparency, box.Parent = Vector2.new(0.5, 0.5), UDim2.fromScale(0.5, 0.5), UDim2.fromScale(0.86, 0.86), 1, bg
+        local lim = Instance.new("UISizeConstraint")
+        lim.MaxSize, lim.Parent = Vector2.new(1000, 720), box
+        -- header: logo, name, account / server / uptime line
+        local x = 0
+        pcall(function()
+            local f = "MartiniHub/logo_v1.png"
+            if not isfile(f) then return end
+            local img = Instance.new("ImageLabel")
+            img.BackgroundTransparency, img.Size, img.Image, img.Parent = 1, UDim2.fromOffset(72, 72), getcustomasset(f), box
+            x = 88
+        end)
+        S.title = S.text(box, Enum.Font.GothamBold, 34, fg, 0, UDim2.fromOffset(x, 4), UDim2.new(1, -x, 0, 40))
+        S.title.Text = "Martini Hub"
+        S.sub = S.text(box, Enum.Font.Gotham, 15, fg, 0.35, UDim2.fromOffset(x, 48), UDim2.new(1, -x, 0, 20))
+        -- cards
+        local grid = Instance.new("Frame")
+        grid.BackgroundTransparency, grid.Position, grid.Size, grid.Parent = 1, UDim2.fromOffset(0, 96), UDim2.new(1, 0, 1, -170), box
+        local gl = Instance.new("UIGridLayout")
+        gl.CellSize, gl.CellPadding, gl.SortOrder, gl.Parent = UDim2.new(1 / 3, -10, 1 / 3, -10), UDim2.fromOffset(14, 14), Enum.SortOrder.LayoutOrder, grid
+        S.cards = {}
+        for i, key in ipairs({ "Money", "Flip profit", "Cars sold", "Garage", "Distance", "Drive farm", "Auctions", "Candy", "Uptime" }) do
+            local f = Instance.new("Frame")
+            f.BackgroundColor3, f.BorderSizePixel, f.LayoutOrder, f.Parent = panel, 0, i, grid
+            local c = Instance.new("UICorner")
+            c.CornerRadius, c.Parent = UDim.new(0, 8), f
+            local st = Instance.new("UIStroke")
+            st.Color, st.Thickness, st.Parent = line, 1, f
+            local bar = Instance.new("Frame") -- accent tick on the left edge
+            bar.BackgroundColor3, bar.BorderSizePixel, bar.Position, bar.Size, bar.Parent = accent, 0, UDim2.fromOffset(0, 14), UDim2.new(0, 3, 0, 18), f
+            local t = S.text(f, Enum.Font.GothamMedium, 13, fg, 0.45, UDim2.fromOffset(16, 14), UDim2.new(1, -32, 0, 18))
+            t.Text = key:upper()
+            S.cards[key] = {
+                v = S.text(f, Enum.Font.GothamBold, 30, fg, 0, UDim2.fromOffset(16, 38), UDim2.new(1, -32, 0, 36)),
+                s = S.text(f, Enum.Font.Gotham, 14, fg, 0.4, UDim2.fromOffset(16, 78), UDim2.new(1, -32, 1, -84)),
+            }
+            S.cards[key].s.TextWrapped = true
+        end
+        -- what auto is doing right now, and how to close
+        S.status = S.text(box, Enum.Font.GothamMedium, 17, accent, 0, UDim2.new(0, 0, 1, -62), UDim2.new(1, 0, 0, 24))
+        S.hint = S.text(box, Enum.Font.Gotham, 13, fg, 0.55, UDim2.new(0, 0, 1, -28), UDim2.new(1, 0, 0, 18))
+        gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+        return gui
+    end
+    function S.fill()
+        local C, m, up = S.cards, myMoney(), os.clock() - S.t0
+        local d = m - S.m0
+        S.sub.Text = ("%s  ·  server %s  ·  %d players  ·  %s"):format(LP.Name, game.JobId:sub(1, 8), #Players:GetPlayers(), os.date("%H:%M"))
+        C["Money"].v.Text = money(m)
+        C["Money"].s.Text = ("%s%s this session · %s/h"):format(d >= 0 and "+" or "-", money(math.abs(d)), money(up > 60 and math.floor(d / (up / 3600)) or 0))
+        C["Flip profit"].v.Text = money(STATE.profit or 0)
+        C["Flip profit"].s.Text = ("over %d sale(s) · %s in sales"):format(STATE.profitSales or 0, money(STATE.earned or 0))
+        local dr = HOOK.WH.drive()
+        C["Cars sold"].v.Text = tostring(STATE.sold or 0)
+        C["Cars sold"].s.Text = ("by the script · %s in the game"):format(dr and tostring(dr.sold) or "?")
+        local held = 0 for _ in pairs(OWNED) do held += 1 end
+        C["Garage"].v.Text = ("%d / %d"):format(#entries(), garageSlots())
+        C["Garage"].s.Text = ("%d flip car(s) in progress"):format(held)
+        C["Distance"].v.Text = dr and ("%.1f km"):format(dr.km) or "-"
+        C["Distance"].s.Text = dr and (dr.owed > 0 and ("owes %.2f km"):format(dr.owed) or ("ahead by %.2f km"):format(-dr.owed)) or "Drive tab not loaded"
+        local fm = HOOK.farm
+        C["Drive farm"].v.Text = fm and fm.on and "on" or "off"
+        C["Drive farm"].s.Text = fm and ((fm.rate and ("%.2f km/min · "):format(fm.rate) or "") .. tostring(fm.status)) or "-"
+        local A = STATE.auction or {}
+        C["Auctions"].v.Text = ("%d opened"):format(A.opened or 0)
+        C["Auctions"].s.Text = ("%s spent · %d won · %s from sold cars"):format(money(A.spent or 0), A.won or 0, money(A.soldFor or 0))
+        local cd = HOOK.candy
+        C["Candy"].v.Text = tostring(cd and cd.got or 0)
+        C["Candy"].s.Text = cd and tostring(cd.status) or "-"
+        C["Uptime"].v.Text = S.dur(up)
+        C["Uptime"].s.Text = ("watchdog %d · rejoins %d · webhook %s"):format(HOOK.WD.fires, HOP.rejoins or 0, tostring(HOOK.WH.status))
+        S.status.Text = "Auto flip: " .. tostring(busy and busyWhat or autoStatus)
+        local k = Library.Options.FIU_StatsKey and Library.Options.FIU_StatsKey.Value
+        S.hint.Text = ("Press %s to close · the menu still opens on top"):format(tostring(k or "the Stats screen key"))
+    end
+    function HOOK.statsShow(on)
+        if HOOK.statsGui then HOOK.statsGui:Destroy(); HOOK.statsGui = nil end
+        if on then
+            HOOK.statsGui = S.build()
+            pcall(S.fill)
+            pcall(RunService.Set3dRenderingEnabled, RunService, false)
+        else
+            -- back to whatever "Disable 3D rendering" says
+            local t = Library.Toggles.FIU_NoRender
+            pcall(RunService.Set3dRenderingEnabled, RunService, not (t and t.Value))
+        end
+    end
+    task.spawn(function()
+        while running do
+            if HOOK.statsGui then pcall(S.fill) end
+            task.wait(1)
+        end
+    end)
+end
+
 -- ============================== config load ==============================
 -- Last, so every tab's settings exist when the autoload config is applied (buy filters, flip loop, drive, ESP...).
 -- Named configs (AUTO included: it is one of the user's presets) change ONLY when you press Save / Overwrite.
@@ -6216,4 +6349,5 @@ do
 end
 
 lifeLog("ready")
-Library:Notify("Fix It Up ready — RightCtrl toggles the UI. Only script-bought cars are ever sold.", 5)
+Library:Notify(("Martini Hub ready: %s opens the menu. Only script-bought cars are ever sold."):format(
+    tostring(Library.Options.MenuKeybind and Library.Options.MenuKeybind.Value or "RightControl")), 5)
