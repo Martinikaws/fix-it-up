@@ -62,6 +62,8 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 
   The best speed is probably around 110–115. The Drive tab's **Auto tune** runs 95/105/115/125/135 and keeps the best.
 - **Candy event (2026-10-10):** `Workspace.Event` has 12 numbered slots (Models), each holding `LOLLYPOPYS`, `LOLLYJAR` and a **ClickDetector**. Clicking a jar collects it. Far slots don't have their lollipop pieces streamed in, but the slot model and its ClickDetector are always present. Slots 1 and 11 share a position. No player candy value was found; refill timing is unknown.
+- **Codes (2026-10-15, decompiled `PlayerGui.HUD.Frames.Codes.CodesClient`):** `Events.HUD.UseCode:InvokeServer(code)` returns `message, Color3`. A made-up code returned "Invalid Code" in red, so red means refused.
+- **Garages (2026-10-15, decompiled `ReplicatedStorage.ClientScripts.Client.GarageClient`):** `Events.BuyGarage:FireServer(garageName)` is what the "Buy Garage" sign sends; the client checks money first and the cars move to the new garage. € garages in `workspace.Garages` (slots = `CarPositions` children): Default 3 (€3K), 4Slots (€30K), 6Slots (€100K), 8Slots (€350K), 10Slots (€800K), 24Slots (€5M). `RobuxGarage` (40) and `RobuxGarage2` (64) have a `ProductId` instead of `Price`; never touch them. Your garage is `PlayerData.GarageModel`.
 - **Traffic:** its folder hasn't been found yet. `HOOK.TR` finds it by name (traffic / npccar / aicar …), and the Settings → Traffic section has a dump button.
 
 ## Features added in the 2026-10-08 → 10 session
@@ -120,3 +122,9 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 ## Potassium MCP (local only)
 
 The owner runs the Potassium executor, which exposes an MCP server at `http://127.0.0.1:8225/mcp` with a bearer token. Add it to your **local** Claude Code config; never commit the token. With it, you can run Lua in the live client to inspect `Workspace.Event`, find the traffic folder, and check values before changing the script.
+
+- **Tools:** `list_clients`, `execute_script {source, pid?}` (returns a `console_cursor`), and `read_console {after_cursor, wait_ms, limit}`.
+- **If the session's MCP tools didn't load** (the server wasn't up when the session started, and `/mcp` didn't help), speak the protocol directly over HTTP. POST JSON-RPC `initialize`, `notifications/initialized`, then `tools/call`, with the `Authorization` header read from `~/.claude.json` (never print it).
+- **Big output:** `writefile` it into the workspace (`%LOCALAPPDATA%\Potassium\workspace`) and read it from disk; long console prints get cut off.
+- **Testing a build before pushing:** copy `fiu_main.lua` to the workspace as `fiu_dev.lua`, run `loadstring(readfile("fiu_dev.lua"), "=fiu_main")()` under xpcall, then poke internals through `getgenv().FIU_MAIN.hook` (= `HOOK`).
+- **Watch out:** loading the script applies the owner's autoload config, which has auto buy/repair/sell on.

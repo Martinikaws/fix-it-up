@@ -162,6 +162,8 @@ local CFG = {
     wdOn = true, wdMins = 10, wdHop = true, -- auto flip stuck watchdog
     buyOrder = "Rarest first", -- or "Best € per minute" (flip ledger)
     perfLow = false, perfFps = 0, perfMute = false, -- Settings > Performance
+    garageUp = false, garageMax = 350000, -- Auto > Garage upgrade (off: it's a big purchase)
+    codesShare = true, -- Settings > Codes: redeem on every account running the script
     cleanAfter = false, paintAfter = false, paintRandom = false, paintMaterial = "Normal", paintColor = Color3.fromRGB(30, 90, 220),
     homeAfterTp = false, aucCount = 1, aucBudget = 75000, aucFloor = 300000, aucStopRare = true, aucNonStop = false, aucSellJunk = true, aucMode = "Total spend", autoLock = false, autoLockTier = "A", autoLockModels = {}, autoLockPctOn = false, autoLockPct = 0.5,
     driveSpeed = 85, driveExtra = 2, driveNoLimit = false, farmResume = true, farmYield = false, driveRoute = "Highway", swapOld = "Store in inventory",
@@ -433,6 +435,54 @@ local function garageSlots()
     local g = workspace.Garages:FindFirstChild(tostring(PD:FindFirstChild("GarageModel") and PD.GarageModel.Value or "Default"))
     local cp = g and g:FindFirstChild("CarPositions")
     return cp and #cp:GetChildren() or 2
+end
+-- Garage upgrade: Events.BuyGarage:FireServer(garageName), exactly what the game's "Buy Garage" sign sends (decompiled
+-- ClientScripts.Client.GarageClient, 2026-10-15). € garages only (Price attribute); the Robux ones carry a ProductId
+-- and go through a product prompt, so they are never touched. The server moves your cars to the new garage.
+-- HOOK.garageNext: the smallest € garage with more slots than yours (or nil).
+function HOOK.garageNext()
+    local cur, best = garageSlots(), nil
+    for _, g in ipairs(workspace.Garages:GetChildren()) do
+        local price, cp = tonumber(g:GetAttribute("Price")), g:FindFirstChild("CarPositions")
+        local slots = cp and #cp:GetChildren() or 0
+        if price and g:GetAttribute("ProductId") == nil and slots > cur and (not best or slots < best.slots) then
+            best = { g = g, name = g.Name, price = price, slots = slots }
+        end
+    end
+    return best
+end
+-- buys it if it fits under maxPrice and leaves the reserve; stands at its sign first (that's where the game's prompt
+-- is, in case the server checks), then confirms PlayerData.GarageModel changed
+function HOOK.garageBuy(maxPrice)
+    local n = HOOK.garageNext()
+    if not n then return false, "no bigger € garage to buy" end
+    if n.price > maxPrice then return false, ("next garage %s costs %s, over the max %s"):format(n.name, money(n.price), money(maxPrice)) end
+    if myMoney() - n.price < CFG.reserve then return false, ("next garage %s needs %s and you keep %s"):format(n.name, money(n.price), money(CFG.reserve)) end
+    local gm = PD:FindFirstChild("GarageModel")
+    local before = gm and gm.Value
+    local function sign()
+        for _, d in ipairs(n.g:GetDescendants()) do
+            if d:IsA("ProximityPrompt") and d.ObjectText == "Buy Garage" then
+                local p = d.Parent
+                return p:IsA("Attachment") and p.WorldPosition or (p:IsA("BasePart") and p.Position) or nil
+            end
+        end
+    end
+    local at = sign()
+    if not at then streamAt(n.g:GetPivot().Position, 5); at = sign() end
+    if at then tpTo(CFrame.new(at + Vector3.new(0, 1, 4))); task.wait(0.5) end
+    Events.BuyGarage:FireServer(n.name)
+    local t = os.clock()
+    repeat task.wait(0.25) until (gm and gm.Value ~= before) or os.clock() - t > 8
+    local ok = gm ~= nil and gm.Value == n.name
+    local msg = ok and ("garage upgraded: %s -> %s (%d slots) for %s"):format(tostring(before), n.name, n.slots, money(n.price))
+        or ("garage upgrade to %s didn't go through (still %s)"):format(n.name, tostring(gm and gm.Value))
+    lifeLog(msg)
+    if ok then pcall(function()
+        local W = HOOK.WH
+        if W and W.valid(W.url) then W.push({ embeds = { { title = "Garage upgraded", description = msg, color = 0x10b981 } } }) end
+    end) end
+    return ok, msg
 end
 local function entries() return Garage:GetChildren() end
 local function entryModel(e) local v = e:FindFirstChild("Model"); return v and v.Value or "?" end
@@ -1987,6 +2037,19 @@ local function buyStep(onlyRare)
     if not CFG.autoBuy then return false end
     if #entries() >= garageSlots() then
         if not onlyRare then autoStatus = ("garage full %d/%d"):format(#entries(), garageSlots()) end
+        -- Garage upgrade (Auto tab, off by default): a bigger € garage under the max price, at most every 2 minutes
+        if CFG.garageUp and not onlyRare and os.clock() - (HOOK.garageTry or -1e9) > 120 then
+            HOOK.garageTry = os.clock()
+            local n = HOOK.garageNext()
+            if n and n.price <= CFG.garageMax and myMoney() - n.price >= CFG.reserve then
+                busy, busyWhat = true, "upgrading the garage to " .. n.name
+                local ok, msg = HOOK.garageBuy(CFG.garageMax)
+                log(msg); pcall(notify, msg)
+                goHome()
+                busy = false
+                return ok
+            end
+        end
         return false
     end
     local j, taken = wantedJunk()
@@ -3401,6 +3464,31 @@ HomeBox:AddButton({ Text = "Go home", Func = function()
 end })
 HomeBox:AddButton({ Text = "Clear home", DoubleClick = true, Func = function() STATE.home = nil; saveState(); showHome() end })
 showHome()
+end
+
+do
+local gu = Tabs.Auto:AddLeftGroupbox("Garage upgrade", "warehouse")
+gu:AddLabel("When auto buy finds the garage full, buys the next bigger € garage (never a Robux one). Your cars move "
+    .. "to it. Only if it costs at most the max below and you still keep your reserve.", true)
+gu:AddToggle("FIU_GarageUp", { Text = "Upgrade garage when full", Default = CFG.garageUp, Callback = set("garageUp") })
+gu:AddSlider("FIU_GarageMax", { Text = "Max garage price", Default = CFG.garageMax, Min = 30000, Max = 5000000, Rounding = 0, Suffix = "€",
+    Callback = set("garageMax") })
+local guLabel = gu:AddLabel("-", true)
+gu:AddButton({ Text = "Buy the next garage now", DoubleClick = true, Tooltip = "Double-click. Ignores the max price, still keeps your reserve.",
+    Func = run("garage", function()
+        local ok, msg = HOOK.garageBuy(math.huge)
+        log(msg); notify(msg)
+        goHome()
+    end) })
+task.spawn(function()
+    while running do
+        local n = HOOK.garageNext()
+        local gm = PD:FindFirstChild("GarageModel")
+        pcall(guLabel.SetText, guLabel, ("Yours: %s (%d slots, %d used)\nNext: %s"):format(tostring(gm and gm.Value or "?"), garageSlots(), #entries(),
+            n and ("%s, %d slots, %s"):format(n.name, n.slots, money(n.price)) or "none (biggest € garage)"))
+        task.wait(5)
+    end
+end)
 end
 
 do
@@ -5053,6 +5141,76 @@ do
     if not hasCap then box:AddLabel("FPS cap: not available on this executor (no setfpscap).", true) end
 end
 
+-- ============================== codes ==============================
+-- Events.HUD.UseCode:InvokeServer(code) -> message, Color3: what the game's own Codes menu sends (decompiled
+-- PlayerGui.HUD.Frames.Codes.CodesClient, 2026-10-15). A made-up code answered "Invalid Code" in red, so red = refused.
+-- "Redeem on all my accounts" adds the codes to FixItUp/codes.json; every account running the script redeems the ones
+-- it hasn't tried yet (kept in codes_<UserId>.json), one every 3 s.
+do
+    local C = { shared = DIR .. "/codes.json", file = ("%s/codes_%d.json"):format(DIR, LP.UserId), status = "No codes tried yet." }
+    HOOK.CODES = C
+    C.done = readJSON(C.file, {})
+    function C.redeem(code)
+        local uc = Events.HUD:FindFirstChild("UseCode")
+        if not uc then return false, "the game's UseCode remote is gone" end
+        local ok, msg, col = pcall(uc.InvokeServer, uc, code)
+        if not ok then return false, tostring(msg) end
+        local good = typeof(col) == "Color3" and col.G > col.R
+        C.done[code] = { msg = tostring(msg), ok = good, at = os.time() }
+        writeJSON(C.file, C.done)
+        return good, tostring(msg)
+    end
+    function C.run(list)
+        local lines = {}
+        for _, code in ipairs(list) do
+            if not C.done[code] then
+                local ok, msg = C.redeem(code)
+                lines[#lines + 1] = ("%s %s: %s"):format(ok and "✓" or "✗", code, msg)
+                task.wait(3)
+            end
+        end
+        if #lines > 0 then C.status = table.concat(lines, "\n"); log("codes: " .. table.concat(lines, " | ")) end
+        return lines
+    end
+    task.spawn(function() -- codes another account added to the shared list
+        task.wait(20)
+        while running do
+            local sh = readJSON(C.shared, {})
+            if CFG.codesShare and type(sh.codes) == "table" then pcall(C.run, sh.codes) end
+            task.wait(60)
+        end
+    end)
+    local cb = Tabs.Settings:AddRightGroupbox("Codes", "ticket")
+    cb:AddLabel("Paste game codes (separated by spaces or commas). Codes already tried on this account are skipped.", true)
+    local input = ""
+    cb:AddInput("FIU_Codes", { Text = "Codes", Default = "", Placeholder = "CODE1 CODE2", Callback = function(v) input = tostring(v or "") end })
+    cb:AddToggle("FIU_CodesShare", { Text = "Redeem on all my accounts", Default = CFG.codesShare,
+        Tooltip = "Adds the codes to a shared list; every account running the script redeems them within a minute",
+        Callback = set("codesShare") })
+    local codeLabel = cb:AddLabel("-", true)
+    cb:AddButton({ Text = "Redeem", Func = function()
+        local list = {}
+        for w in input:gmatch("[^,%s]+") do list[#list + 1] = w end
+        if #list == 0 then notify("Type at least one code first") return end
+        if CFG.codesShare then
+            local sh = readJSON(C.shared, {})
+            sh.codes = type(sh.codes) == "table" and sh.codes or {}
+            local have = {}
+            for _, c in ipairs(sh.codes) do have[c] = true end
+            for _, c in ipairs(list) do if not have[c] then sh.codes[#sh.codes + 1] = c end end
+            writeJSON(C.shared, sh)
+        end
+        task.spawn(function()
+            local lines = C.run(list)
+            notify(#lines > 0 and table.concat(lines, "\n") or "Those codes were already tried on this account")
+        end)
+    end })
+    cb:AddButton({ Text = "Forget tried codes (this account)", DoubleClick = true, Func = function()
+        C.done = {}; writeJSON(C.file, {}); C.status = "Tried list cleared."
+    end })
+    task.spawn(function() while running do pcall(codeLabel.SetText, codeLabel, C.status); task.wait(2) end end)
+end
+
 local World = Tabs.Settings:AddLeftGroupbox("Traffic", "car-front")
 World:AddToggle("FIU_NoTraffic", { Text = "Disable traffic", Default = true,
     Tooltip = "Removes the AI traffic cars on your screen (only for you). On every time the script loads.",
@@ -5428,7 +5586,7 @@ SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 -- a config is the WHOLE menu: every toggle (distance farm, auto hop, gold contract included), slider, dropdown, input
 -- and color is saved and loaded. Nothing is excluded (user, 2026-10-01: "the configs will save the configuration of the menu").
-SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_Stats", "FIU_WhGroup", "FIU_WhOffline", "FIU_WhSummary", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
+SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_Stats", "FIU_WhGroup", "FIU_WhOffline", "FIU_WhSummary", "FIU_Codes", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
 -- Martini Hub look: dark graphite with an emerald accent, Gotham font (still switchable under Settings > Themes)
@@ -6315,6 +6473,7 @@ ModBox:AddToggle("FIU_StaffBoard", { Text = "Staff status list", Default = HOP.s
 ModBox:AddButton({ Text = "Refresh staff list", Func = function() STAFF.wake = true end })
 local staffLabel = ModBox:AddLabel("-", true)
 getgenv().FIU_MAIN.staff = STAFF -- for scripted tests
+getgenv().FIU_MAIN.hook = HOOK -- for scripted tests (the Potassium MCP)
 task.spawn(function()
     while running do
         if HOP.staffBoard then
