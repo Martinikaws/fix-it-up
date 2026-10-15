@@ -1,6 +1,8 @@
-# Fix It Up! script (CruelHub)
+# Martini Hub (Fix It Up! script)
 
-A Roblox exploit script for **Fix It Up!** (place 72712036210947). It uses the Obsidian UI library (deividcomsono) and is titled "CruelHub". The owner is Martinikaws, who writes in English and Italian.
+A Roblox exploit script for **Fix It Up!** (place 72712036210947). It uses the Obsidian UI library (deividcomsono) and is titled **"Martini Hub"** (renamed from "CruelHub" on 2026-10-15). The owner is Martinikaws, who writes in English and Italian.
+
+**Look:** Emerald theme set with `ThemeManager:SetDefaultTheme` (background `0a0d0b`, main `121714`, accent `10b981`, outline `1d2a23`, text `e8f2ec`), Gotham font, corner radius 6. The window icon is `assets/logo.png` from this repo, cached as `MartiniHub/logo_v1.png`; bump the `_v1` suffix when the logo changes, or old caches keep showing the old one. If the image can't load, it falls back to the Lucide `wrench` icon. Webhook posts use the username "Martini Hub". Internal names (`FIU_*` globals, the `FixItUp/` settings folder) were kept so existing settings still load.
 
 Everything is in one file, `fiu_main.lua` (~5,650 lines). Users load it with:
 

@@ -1,4 +1,4 @@
-# Fix It Up
+# Martini Hub · Fix It Up
 
 Script for Fix It Up! (place 72712036210947), Obsidian UI.
 

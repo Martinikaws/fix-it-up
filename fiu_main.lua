@@ -1,5 +1,5 @@
 --[[
-    Fix It Up! (place 72712036210947) — junkyard tiers + auto flip
+    Martini Hub — Fix It Up! (place 72712036210947): junkyard tiers + auto flip
     UI: Obsidian (deividcomsono)
 
     Junkyard: every junk car named (the game hides it) + tier by spawn chance, colored billboard + outline,
@@ -205,12 +205,12 @@ function HOOK.ask(text)
     gui.Name, gui.ResetOnSpawn, gui.DisplayOrder = "FIU_Confirm", false, 1000
     local f = Instance.new("Frame")
     f.Size, f.Position, f.AnchorPoint = UDim2.fromOffset(340, 130), UDim2.fromScale(0.5, 0.5), Vector2.new(0.5, 0.5)
-    f.BackgroundColor3, f.BorderSizePixel, f.Parent = Color3.fromRGB(25, 25, 30), 0, gui
+    f.BackgroundColor3, f.BorderSizePixel, f.Parent = Color3.fromRGB(18, 23, 20), 0, gui
     local l = Instance.new("TextLabel")
     l.Size, l.Position, l.BackgroundTransparency = UDim2.new(1, -20, 0, 70), UDim2.fromOffset(10, 8), 1
     l.Text, l.TextWrapped, l.TextColor3, l.Font, l.TextSize, l.Parent = text, true, Color3.new(1, 1, 1), Enum.Font.Gotham, 15, f
     local answer
-    for i, opt in ipairs({ { "Yes", true, Color3.fromRGB(60, 160, 80) }, { "No", false, Color3.fromRGB(170, 60, 60) } }) do
+    for i, opt in ipairs({ { "Yes", true, Color3.fromRGB(16, 185, 129) }, { "No", false, Color3.fromRGB(170, 60, 60) } }) do
         local b = Instance.new("TextButton")
         b.Size, b.Position = UDim2.fromOffset(150, 34), UDim2.fromOffset(i == 1 and 15 or 175, 86)
         b.Text, b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.BorderSizePixel = opt[1], opt[3], Color3.new(1, 1, 1), Enum.Font.GothamBold, 15, 0
@@ -1540,9 +1540,9 @@ function HOOK.WH.push(payload)
     if not HOOK.WH.valid(HOOK.WH.url) then return false end
     for _, e in ipairs(payload.embeds or {}) do
         e.timestamp = e.timestamp or DateTime.now():ToIsoDate()
-        e.footer = e.footer or { text = ("Fix It Up · %s · server %s · %d players"):format(LP.Name, game.JobId:sub(1, 8), #Players:GetPlayers()) }
+        e.footer = e.footer or { text = ("Martini Hub · %s · server %s · %d players"):format(LP.Name, game.JobId:sub(1, 8), #Players:GetPlayers()) }
     end
-    payload.username = payload.username or "Fix It Up"
+    payload.username = payload.username or "Martini Hub"
     HOOK.WH.q[#HOOK.WH.q + 1] = payload
     return true
 end
@@ -2551,21 +2551,22 @@ end
 notify = function(msg) Library:Notify(msg, 5) end
 
 local Window = Library:CreateWindow({
-    Title = "CruelHub", Icon = (function() -- CruelHub logo from the repo, cached in the workspace; a skull if the executor can't load it
+    Title = "Martini Hub", Icon = (function() -- logo from this repo, cached in the workspace; a wrench if the executor can't load it
         local ok, id = pcall(function()
-            local f = "CruelHub/logo.jpg"
-            if not isfolder("CruelHub") then makefolder("CruelHub") end
+            local f = "MartiniHub/logo_v1.png" -- bump the version when assets/logo.png changes, or old caches keep the old one
+            if not isfolder("MartiniHub") then makefolder("MartiniHub") end
             if not isfile(f) then
-                local img = game:HttpGet("https://raw.githubusercontent.com/LeeDoesStuff/Lee-sStuff/main/assets/cruelhub.jpg")
-                assert(img:sub(1, 2) == "\255\216", "not a jpeg")
+                local img = game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up/main/assets/logo.png")
+                assert(img:sub(1, 4) == "\137PNG", "not a png")
                 writefile(f, img)
             end
             return getcustomasset(f)
         end)
-        return ok and id or "skull"
-    end)(), Footer = "Fix It Up · junkyard tiers · auto flip · repair · distance farm",
+        return ok and id or "wrench"
+    end)(), Footer = "Martini Hub · Fix It Up · auto flip · repair · distance farm",
     Size = UDim2.fromOffset(704, 824), -- default window size (user pick)
     Center = true, AutoShow = true, ToggleKeybind = Enum.KeyCode.RightControl,
+    Font = Enum.Font.Gotham, CornerRadius = 6,
 })
 -- unloaded by a newer copy while we were still setting up: don't leave a dead menu behind
 if not running or getgenv().FIU_TOKEN ~= HOOK.token then running = false; pcall(Library.Unload, Library); return end
@@ -4445,7 +4446,7 @@ local whStatus = WhBox:AddLabel("-", true)
 WhBox:AddButton({ Text = "Send test", Func = function()
     if not (request or http_request or (syn and syn.request)) then HOOK.WH.status = "your executor has no request() function"; notify(HOOK.WH.status) return end
     if not HOOK.WH.valid(HOOK.WH.url) then notify("Paste a webhook URL first") return end
-    HOOK.WH.push({ embeds = { { title = "Webhook connected", description = "Fix It Up alerts will post here.", color = 0xe0233c } } })
+    HOOK.WH.push({ embeds = { { title = "Webhook connected", description = "Martini Hub alerts will post here.", color = 0x10b981 } } })
 end })
 
 local SpBox = Tabs.Webhook:AddRightGroupbox("Rare car spawns", "car")
@@ -4951,8 +4952,8 @@ SaveManager:IgnoreThemeSettings()
 SaveManager:SetIgnoreIndexes({ "FIU_WhUrl", "FIU_WhSpawns", "FIU_WhSpawnMin", "FIU_WhExclusive", "FIU_WhPingMin", "FIU_WhPingId", "FIU_WhMoney", "FIU_WhEvery", "FIU_NoRender", "FIU_WhGroup", "FIU_NoTraffic", "FIU_NoTrafficCol", "FIU_KwOn", "FIU_KwWords", "FIU_KwWhole", "FIU_KwWait" })
 SaveManager:SetFolder(DIR)
 ThemeManager:SetFolder(DIR)
--- CruelHub look: near-black with a crimson accent (still switchable under Settings > Themes)
-ThemeManager:SetDefaultTheme({ BackgroundColor = "0c0a0b", MainColor = "161214", AccentColor = "e0233c", OutlineColor = "2a1d20", FontColor = "f2eded" })
+-- Martini Hub look: dark graphite with an emerald accent, Gotham font (still switchable under Settings > Themes)
+ThemeManager:SetDefaultTheme({ BackgroundColor = "0a0d0b", MainColor = "121714", AccentColor = "10b981", OutlineColor = "1d2a23", FontColor = "e8f2ec", FontFace = "Gotham" })
 SaveManager:BuildConfigSection(Tabs.Settings)
 ThemeManager:ApplyToTab(Tabs.Settings, "palette")
 -- the autoload config is applied at the very END of the script (see "config load"): tabs built after this point

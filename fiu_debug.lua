@@ -1,5 +1,5 @@
 --[[
-    CruelHub debug: tests the pieces the Fix It Up! script depends on, in the live game, and writes a report.
+    Martini Hub debug: tests the pieces the Fix It Up! script depends on, in the live game, and writes a report.
     Run it ALONE on the account (it unloads the main script first), standing on open flat ground outside any
     building, with at least one car in your garage:
 
@@ -33,7 +33,7 @@ local function chk(cond, name, detail)
     return cond
 end
 function D.text()
-    local head = ("CruelHub debug report | %s | place %s | job %s | user %s | %d players\n"):format(os.date("%Y-%m-%d %H:%M:%S"),
+    local head = ("Martini Hub debug report | %s | place %s | job %s | user %s | %d players\n"):format(os.date("%Y-%m-%d %H:%M:%S"),
         tostring(game.PlaceId), game.JobId:sub(1, 8), LP.Name, #Players:GetPlayers())
     return head .. table.concat(D.lines, "\n") .. ("\n-- %d pass, %d fail, %d warn --"):format(D.pass, D.fail, D.warn)
 end
@@ -500,24 +500,24 @@ local function buildUI()
     if not pcall(function() gui.Parent = parent end) then gui.Parent = LP:WaitForChild("PlayerGui") end
     D.gui = gui
     local f = Instance.new("Frame")
-    f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel, f.Active, f.Draggable = UDim2.fromOffset(580, 420), UDim2.new(0, 10, 0.5, -210), Color3.fromRGB(22, 22, 28), 0, true, true
+    f.Size, f.Position, f.BackgroundColor3, f.BorderSizePixel, f.Active, f.Draggable = UDim2.fromOffset(580, 420), UDim2.new(0, 10, 0.5, -210), Color3.fromRGB(18, 23, 20), 0, true, true
     f.Parent = gui
     local title = Instance.new("TextLabel")
     title.Size, title.Position, title.BackgroundTransparency, title.TextXAlignment = UDim2.new(1, -10, 0, 22), UDim2.fromOffset(8, 4), 1, Enum.TextXAlignment.Left
-    title.Text, title.TextColor3, title.Font, title.TextSize, title.Parent = "CruelHub debug: stand on open ground, then press Run all", Color3.new(1, 1, 1), Enum.Font.GothamBold, 14, f
+    title.Text, title.TextColor3, title.Font, title.TextSize, title.Parent = "Martini Hub debug: stand on open ground, then press Run all", Color3.fromRGB(16, 185, 129), Enum.Font.GothamBold, 14, f
     local function mk(text, x, y, w, cb)
         local b = Instance.new("TextButton")
-        b.Size, b.Position, b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.BorderSizePixel = UDim2.fromOffset(w, 26), UDim2.fromOffset(x, y), Color3.fromRGB(52, 56, 90), Color3.new(1, 1, 1), Enum.Font.Gotham, 13, 0
+        b.Size, b.Position, b.BackgroundColor3, b.TextColor3, b.Font, b.TextSize, b.BorderSizePixel = UDim2.fromOffset(w, 26), UDim2.fromOffset(x, y), Color3.fromRGB(29, 42, 35), Color3.new(1, 1, 1), Enum.Font.Gotham, 13, 0
         b.Text, b.Parent = text, f
         b.MouseButton1Click:Connect(cb)
         return b
     end
     local scroll = Instance.new("ScrollingFrame")
-    scroll.Size, scroll.Position, scroll.BackgroundColor3, scroll.BorderSizePixel = UDim2.new(1, -16, 1, -96), UDim2.fromOffset(8, 88), Color3.fromRGB(14, 14, 18), 0
+    scroll.Size, scroll.Position, scroll.BackgroundColor3, scroll.BorderSizePixel = UDim2.new(1, -16, 1, -96), UDim2.fromOffset(8, 88), Color3.fromRGB(10, 13, 11), 0
     scroll.AutomaticCanvasSize, scroll.CanvasSize, scroll.ScrollBarThickness, scroll.Parent = Enum.AutomaticSize.Y, UDim2.new(), 6, f
     local label = Instance.new("TextLabel")
     label.Size, label.AutomaticSize, label.BackgroundTransparency, label.TextXAlignment, label.TextYAlignment = UDim2.new(1, -8, 0, 0), Enum.AutomaticSize.Y, 1, Enum.TextXAlignment.Left, Enum.TextYAlignment.Top
-    label.TextWrapped, label.Font, label.TextSize, label.TextColor3, label.Text, label.Parent = true, Enum.Font.Code, 12, Color3.fromRGB(220, 220, 230), "", scroll
+    label.TextWrapped, label.Font, label.TextSize, label.TextColor3, label.Text, label.Parent = true, Enum.Font.Code, 12, Color3.fromRGB(232, 242, 236), "", scroll
     function D.refresh()
         local from = math.max(1, #D.lines - 350)
         label.Text = table.concat(D.lines, "\n", from)
