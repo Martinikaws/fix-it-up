@@ -100,7 +100,17 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 
 ## Debug script
 
-`fiu_debug.lua` (standalone, not loaded by the main script) tests the game pieces the script depends on and writes a report to `FixItUp/debug_<UserId>.txt` and the clipboard: executor functions, game paths, repair shops/machines, store clicks (fireclickdetector vs real clicks), spawn + five ways of sitting in the DriveSeat with state/message logging, a drive-loop ejection check, and hood + remove/reinstall one part. It unloads the main script first. Load it with `loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up/main/fiu_debug.lua"))()`. Paste its report back when auto/drive misbehaves.
+`fiu_debug.lua` (standalone, not loaded by the main script) writes a report to `FixItUp/debug_<UserId>.txt`, the clipboard, and optionally a Discord webhook. It is written **without newer Luau syntax** (no `+=`, `//`, generalized `for`, if-expressions, interpolation) so it runs even where the main script can't compile; keep it that way.
+
+- **Quick check** (safe; `exec`, `compile`, `logs`, `load`):
+  - every executor function the main script uses, each tested for real: file overwrite/append/nested JSON/listfiles, `HttpGet`, `request()` field names, `getcustomasset`, `gethui`;
+  - each newer Luau feature compiled on its own, which names what an old compiler lacks;
+  - the confirm-dialog route (getcallbackvalue / `_G` / Yes-No box) and the click route;
+  - `fiu_main.lua` and the three Obsidian files compiled with the executor's compiler, plus stale local copies (`BattleBotFarm/lib`, local `fiu_main.lua`);
+  - tails of `errors.txt`, `reload_error.txt` and `life.log`;
+  - finally, loads the real script under `xpcall` (chunk `=fiu_main`, so errors carry line numbers) while capturing `LogService` errors and new `errors.txt` lines.
+- **Full test** adds the game tests: paths, store click (declined), spawn + 5 sit methods + drive loop, hood + remove/reinstall a part.
+- **Remote:** with `getgenv().FIU_DEBUG_WEBHOOK = "<url>"` set before the loadstring, it runs the Quick check by itself and posts the report as a `.txt` attachment (multipart; falls back to chunked messages) once before the load test and once at the end. Otherwise it uses the URL pasted in its window or the one in `FixItUp/webhook.json`. This is how to debug an executor on a PC the owner can't access.
 
 ## Potassium MCP (local only)
 

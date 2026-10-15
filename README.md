@@ -8,8 +8,15 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up
 
 ## Debug
 
-If auto flip or the Drive farm misbehaves, run this and send the report it copies:
+If the script doesn't load, or auto flip / the Drive farm misbehaves, run this and press **Quick check**. It's safe: nothing moves and nothing is bought.
 
 ```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up/main/fiu_debug.lua"))()
+```
+
+On someone else's PC, add your Discord webhook first. The check then runs by itself and the report arrives in your Discord as a `.txt` file:
+
+```lua
+getgenv().FIU_DEBUG_WEBHOOK = "https://discord.com/api/webhooks/..."
 loadstring(game:HttpGet("https://raw.githubusercontent.com/Martinikaws/fix-it-up/main/fiu_debug.lua"))()
 ```
