@@ -183,6 +183,23 @@ function HOOK.now()
     local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
     return ok and t > 0 and math.floor(t) or os.time()
 end
+-- a RemoteFunction call that stops waiting after `timeout` s. The server can leave an invoke unanswered forever: on
+-- 2026-10-15 RemoteLoad never answered and auto flip sat on "repairing Lion JF-S" with nothing moving. Returns what
+-- pcall(InvokeServer) would, or false, "<why>" on a timeout (the call itself is left behind, harmless).
+function HOOK.invoke(remote, timeout, ...)
+    local args, n = { ... }, select("#", ...)
+    local res
+    task.spawn(function() res = table.pack(pcall(remote.InvokeServer, remote, table.unpack(args, 1, n))) end)
+    local t = os.clock()
+    while not res and os.clock() - t < timeout do task.wait(0.1) end
+    if not res then HOOK.deadNote(remote.Name); return false, ("the server didn't answer %s in %d s"):format(remote.Name, timeout) end
+    HOOK.deadOk()
+    return table.unpack(res, 1, res.n)
+end
+-- server requests that went unanswered in a row (HOOK.invoke, streamAt); the dead-server hop (Server hop tab) acts on it
+HOOK.DEAD = { n = 0, last = "" }
+function HOOK.deadNote(what) local D = HOOK.DEAD; D.n += 1; D.at = D.at or os.clock(); D.last = what end
+function HOOK.deadOk() HOOK.DEAD.n, HOOK.DEAD.at = 0, nil end
 local OWNED = readJSON(HOOK.ownedFile, nil) -- [garage GUID] = { model, boughtAt } — the ONLY sellable cars
 if not OWNED and select(2, pcall(isfile, HOOK.ownedFile)) == true then
     -- the file is there but unreadable (cut short by a crash mid-write): take the backup, never the stale pre-2026-10-08
@@ -723,7 +740,7 @@ local function spawnCar(e, cf)
     local raised = false
     streamAt(cf.Position, 5) -- a car spawned out of streaming range arrives empty
     for try = 1, 3 do
-        local ok, err = pcall(function() Events.Vehicles.RemoteLoad:InvokeServer(e, cf) end)
+        local ok, err = HOOK.invoke(Events.Vehicles.RemoteLoad, 10, e, cf) -- the car is checked for below either way
         if not ok then log("spawn failed: " .. tostring(err)) end
         local t = os.clock()
         repeat
@@ -734,7 +751,7 @@ local function spawnCar(e, cf)
                     raised = true
                     log(("%s spawned %.1f studs into the floor: respawning it higher"):format(entryModel(e), depth))
                     cf = cf + Vector3.new(0, depth + 1, 0)
-                    pcall(function() Events.Vehicles.RemoteLoad:InvokeServer(e, cf) end)
+                    HOOK.invoke(Events.Vehicles.RemoteLoad, 10, e, cf)
                     task.wait(1) -- let the respawned car replace the sunk one
                     t = os.clock()
                 else
@@ -2309,7 +2326,8 @@ local HOP_FILE, VISIT_TTL = ("fiu_hop_%d.json"):format(LP.UserId), 3600
 local HOP = readJSON(HOP_FILE, nil)
 if not HOP then HOP = readJSON("fiu_hop.json", {}); HOP.auto = false; HOP.hops = 0 end
 for k, v in pairs({ auto = false, max = 50, over = 0, maxp = 8, hops = 0, visited = {}, hard = false, hardMax = 1500, gate = false, leaveOnFail = false, chatBlock = true, chatSpam = false, chatSpamN = 20, kwOn = false, kwWords = "", kwWhole = true, kwWait = true,
-    antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest", rejoin = true, rejoinDelay = 5, rejoins = 0 }) do if HOP[k] == nil then HOP[k] = v end end
+    antiMod = true, modRank = 2, modAction = "Leave game", staffBoard = true, prefer = "Largest", rejoin = true, rejoinDelay = 5, rejoins = 0,
+    deadHop = true }) do if HOP[k] == nil then HOP[k] = v end end
 local function saveHop() writeJSON(HOP_FILE, HOP) end
 do
     local now = os.time()
@@ -2838,6 +2856,48 @@ do
         end)
     end)
 end
+
+-- ============================== dead server hop ==============================
+-- A server can stop answering: on 2026-10-15 RemoteLoad still spawned the car but never replied, the sell prompt never
+-- streamed in and the hood never opened, so every job failed quietly (no error: the stuck watchdog never fired).
+-- 4 unanswered server calls in a row (HOOK.invoke), spread over 90 s+, while auto or the drive farm runs: hop to another
+-- server like a keyword hop (after the running job, at most 60 s). If that already happened twice in 30 min the
+-- server isn't the problem (a game update?): stop hopping and say so.
+task.spawn(function()
+    while running do
+        task.wait(5)
+        local D = HOOK.DEAD
+        local active = CFG.autoBuy or CFG.autoRepair or CFG.autoSell or (HOOK.farm and HOOK.farm.on)
+        if HOP.deadHop and active and D.n >= 4 and D.at and os.clock() - D.at > 90 and not (STAFF.leaving or STAFF.kwBusy or hopping or STAFF.rejoining) then
+            local recent = {}
+            for _, t in ipairs(HOP.deadHops or {}) do if os.time() - t < 1800 then recent[#recent + 1] = t end end
+            local why = ("%d server calls in a row went unanswered (last: %s)"):format(D.n, D.last)
+            HOOK.deadOk()
+            if #recent >= 2 then
+                if not STAFF.deadWarned then
+                    STAFF.deadWarned = true
+                    lifeLog("dead server: " .. why .. ", but 2 hops in 30 min didn't help: not hopping again")
+                    pcall(notify, "Server calls keep going unanswered on every server: not hopping again (maybe a game update). Send errors.txt / life.log.")
+                end
+            else
+                recent[#recent + 1] = os.time()
+                HOP.deadHops = recent; saveHop()
+                lifeLog("dead server: " .. why .. " -> hopping")
+                pcall(notify, "This server stopped answering (" .. why .. "): hopping to another one")
+                pcall(function()
+                    local W = HOOK.WH
+                    if W and W.valid(W.url) then W.push({ embeds = { { title = "Server not answering: hopping", description = why, color = 0xe67e22 } } }) end
+                end)
+                STAFF.leaving = true -- nothing new starts
+                local t = os.clock()
+                while running and busy and os.clock() - t < 60 do task.wait(0.5) end
+                local ok = STAFF.hopOnce()
+                if running and not ok then pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LP) end
+                STAFF.leaving = false
+            end
+        end
+    end
+end)
 
 -- ============================== unload ==============================
 local Library
@@ -3847,7 +3907,7 @@ do
             end
         end
         if not src then
-            local ok, id = pcall(function() return Events.Vehicles.GetModel:InvokeServer(name, true) end)
+            local ok, id = HOOK.invoke(Events.Vehicles.GetModel, 10, name, true)
             if ok and typeof(id) == "string" then
                 local t, m = os.clock(), nil
                 repeat m = LP.PlayerGui:FindFirstChild(id); task.wait(0.1) until (m and m:FindFirstChild("A-Chassis Tune")) or os.clock() - t > 15
@@ -5207,7 +5267,7 @@ do
     function C.redeem(code)
         local uc = Events.HUD:FindFirstChild("UseCode")
         if not uc then return false, "the game's UseCode remote is gone" end
-        local ok, msg, col = pcall(uc.InvokeServer, uc, code)
+        local ok, msg, col = HOOK.invoke(uc, 15, code)
         if not ok then return false, tostring(msg) end
         local good = typeof(col) == "Color3" and col.G > col.R
         C.done[code] = { msg = tostring(msg), ok = good, at = os.time() }
@@ -6502,6 +6562,9 @@ do
     rj:AddSlider("FIU_RejoinDelay", { Text = "Wait before rejoining", Default = HOP.rejoinDelay, Min = 3, Max = 60, Rounding = 0, Suffix = " s",
         Callback = function(v) HOP.rejoinDelay = v; saveHop() end })
     rj:AddLabel(("Rejoined %d time(s)%s"):format(HOP.rejoins or 0, HOP.rejoinInfo and (" · last: " .. HOP.rejoinInfo) or ""), true)
+    rj:AddToggle("FIU_DeadHop", { Text = "Hop when the server stops answering", Default = HOP.deadHop,
+        Tooltip = "4 server calls in a row unanswered (car spawns time out) while auto or the drive farm runs: hop to another server. "
+            .. "Stops after 2 such hops in 30 min.", Callback = function(v) HOP.deadHop = v; saveHop() end })
 end
 
 local ModBox = Tabs.Hop:AddRightGroupbox("Anti-mod", "shield-alert")
