@@ -443,6 +443,21 @@ local function fireParts(e, ...)
     log("car not loaded: " .. entryModel(e))
     return false
 end
+-- the car's current instance once its Values have loaded, or nil after timeout. A respawn, or the car streaming out
+-- while you're at the store, swaps the instance: the one a job held on to loses its children, and indexing it threw
+-- "Values / Body is not a valid member of Model" (78 times in one evening, 2026-10-10)
+function HOOK.carNow(e, timeout)
+    local t, streamed = os.clock(), false
+    repeat
+        local c = carOf(e)
+        local v = c and c:FindFirstChild("Values")
+        local eng = v and v:FindFirstChild("Engine")
+        if eng and eng:FindFirstChild("Wear") then return c end
+        if c and not streamed and os.clock() - t > 1 then streamed = true; pcall(streamAt, c:GetPivot().Position, 3) end
+        task.wait(0.1)
+    until os.clock() - t > (timeout or 5)
+    return nil
+end
 -- the hood ClickDetector only reaches 10 studs: stand just outside the hood, away from the car's middle
 local function hoodSpot(car)
     local det = car:FindFirstChild("Misc") and car.Misc:FindFirstChild("Hood") and car.Misc.Hood:FindFirstChild("Detector")
@@ -620,8 +635,10 @@ local function spawnCar(e, cf)
                     t = os.clock()
                 else
                     task.wait(1)
-                    c = carOf(e) or c
-                    if c.Parent and c:GetPivot().Position.Y > cf.Y - 15 then return c end -- not falling through the map
+                    -- the instance can be swapped in that second: hand back the current one, loaded
+                    c = HOOK.carNow(e, 5)
+                    if not c then log(("%s didn't finish loading after the spawn"):format(entryModel(e))) return nil end
+                    if c:GetPivot().Position.Y > cf.Y - 15 then return c end -- not falling through the map
                     log(("%s fell through the floor at the spawn spot"):format(entryModel(e)))
                     return nil
                 end
@@ -815,18 +832,28 @@ end
 local busy, busyWhat, manualPending = false, nil, false
 local INSTALL_FIRST = { EngineBlock = 1 }
 
-local function repairCar(e)
+-- Never hold one car instance across a wait: a respawn or the car streaming out swaps it (see HOOK.carNow), so every
+-- step below reads the current one.
+function HOOK.repairRaw(e)
+    HOOK.repairParts = nil
     log(("repairing %s at %s"):format(entryModel(e), ST.name()))
     tpTo(liftCF() * CFrame.new(0, 0, 12)) -- be there first so the car streams in with you
-    local car = spawnCar(e, liftCF())
-    if not car then return false, "spawn failed" end
-    local eng, wear = car.Values.Engine, car.Values.Engine.Wear
+    if not spawnCar(e, liftCF()) then return false, "spawn failed" end
+    local car = HOOK.carNow(e, 5)
+    if not car then return false, "car didn't load after the spawn" end
     tpTo(hoodSpot(car))
     task.wait(0.4)
     -- IsHoodOpen only exists once the hood has been used on this spawn
-    local function hoodOpen() local v = car.Values.Cache:FindFirstChild("IsHoodOpen"); return v ~= nil and v.Value end
+    local function hoodOpen()
+        local c = carOf(e)
+        local v = c and c:FindFirstChild("Values")
+        v = v and v:FindFirstChild("Cache")
+        v = v and v:FindFirstChild("IsHoodOpen")
+        return v ~= nil and v.Value
+    end
     -- a fresh spawn needs a moment before its hood takes clicks; 10-stud range, so re-stand each try
-    local hood = car:WaitForChild("Misc", 5) and car.Misc:WaitForChild("Hood", 5)
+    local misc = car:WaitForChild("Misc", 5)
+    local hood = misc and misc:WaitForChild("Hood", 5)
     local det = hood and hood:WaitForChild("Detector", 5)
     local cd = det and det:FindFirstChildWhichIsA("ClickDetector")
     -- measured 2026-09-28: a freshly spawned car ignores hood clicks for ~4.5 s, so keep clicking for up to 10 s
@@ -843,7 +870,12 @@ local function repairCar(e)
     if cd and not hoodOpen() then return false, "couldn't open the hood" end
 
     -- slots to pull: installed, worn, and either repairable or replaceable
-    local bay = car.Body:FindFirstChild("EngineBay")
+    car = HOOK.carNow(e, 5)
+    if not car then return false, "car unloaded at the hood" end
+    local eng, wear = car.Values.Engine, car.Values.Engine.Wear
+    local body = car:FindFirstChild("Body") or car:WaitForChild("Body", 5)
+    if not body then return false, "car body didn't load" end
+    local bay = body:FindFirstChild("EngineBay")
     local pull = {}
     for _, v in ipairs(eng:GetChildren()) do
         local w = wear:FindFirstChild(v.Name)
@@ -856,12 +888,15 @@ local function repairCar(e)
 
     local before = myParts()
     for _, slot in ipairs(pull) do
-        if eng[slot].Value ~= "" then fireParts(e, "RemovePart", slot); task.wait(0.3) end
+        local c = HOOK.carNow(e, 3)
+        local v = c and c.Values.Engine:FindFirstChild(slot)
+        if v and v.Value ~= "" then fireParts(e, "RemovePart", slot); task.wait(0.3) end
     end
     task.wait(1)
     -- everything that came off, including parts the engine block dragged along
     local parts = {}
     for p in pairs(myParts()) do if not before[p] then parts[#parts + 1] = p end end
+    HOOK.repairParts = parts -- repairCar puts these back if anything below throws
 
     local jobs, installs, pinned = {}, {}, {}
     local pin = on(RunService.Heartbeat, function()
@@ -875,7 +910,8 @@ local function repairCar(e)
             end
         end
     end)
-    local parkCF = car:GetPivot() * CFrame.new(0, 6, 0) -- non-machine parts wait above the car
+    HOOK.repairPin = pin
+    local parkCF = (carOf(e) or car):GetPivot() * CFrame.new(0, 6, 0) -- non-machine parts wait above the car
     for _, p in ipairs(parts) do
         local w, rm = p:GetAttribute("Wear") or 0, p:GetAttribute("RepairMachine")
         if w >= CFG.repairMin and rm then
@@ -954,7 +990,24 @@ local function repairCar(e)
     pin:Disconnect()
     local left = 0
     for _, p in ipairs(installs) do if p.Parent == MoveParts then left += 1 end end
-    return left == 0, ("%s condition %s%%%s"):format(entryModel(e), tostring(condition(car)), left > 0 and (" · " .. left .. " part(s) not installed") or "")
+    return left == 0, ("%s condition %s%%%s"):format(entryModel(e), tostring(condition(carOf(e))), left > 0 and (" · " .. left .. " part(s) not installed") or "")
+end
+
+-- A throw half way used to skip autoStep's try counter, so the same car was retried every 2 s for good, and it left
+-- the parts pin running and the pulled parts on the floor. Now a throw is one failed try, with the parts put back
+-- (ReapplyPart has no distance gate).
+local function repairCar(e)
+    local ok, a, b = pcall(HOOK.repairRaw, e)
+    if HOOK.repairPin then HOOK.repairPin:Disconnect(); HOOK.repairPin = nil end
+    if ok then return a, b end
+    for _ = 1, 2 do
+        for _, p in ipairs(HOOK.repairParts or {}) do
+            if p.Parent == MoveParts then fireParts(e, "ReapplyPart", p); task.wait(0.3) end
+        end
+        task.wait(0.8)
+    end
+    HOOK.repairParts = nil
+    return false, "repair error: " .. tostring(a)
 end
 
 -- ============================== clean / paint ==============================
@@ -993,7 +1046,8 @@ function HOOK.cleanRaw(e)
     end
     local car = spawnCar(e, inBox(det))
     if not car then restore(); return false, "spawn failed" end
-    local dirt = car.Values:FindFirstChild("DirtLevel")
+    local cv = car:FindFirstChild("Values")
+    local dirt = cv and cv:FindFirstChild("DirtLevel")
     if dirt and dirt.Value <= 0 then restore(); return true, entryModel(e) .. " is already clean" end
     local prompt = wash:FindFirstChild("Prompt")
     local pp = prompt and prompt:FindFirstChildWhichIsA("ProximityPrompt")
@@ -1015,7 +1069,7 @@ function HOOK.cleanRaw(e)
     if not tool then restore(); return false, "the car wash didn't hand over a pressure washer" end
     local h = hum()
     if h then h:EquipTool(tool) end
-    tpTo(car:GetPivot() * CFrame.new(5, 1, 0))
+    tpTo((carOf(e) or car):GetPivot() * CFrame.new(5, 1, 0))
     local start = dirt and dirt.Value or 100
     for i = 1, 40 do -- 10 s at 4 Hz, the same curve the game's washer sends
         Events.Vehicles.SetDirt:FireServer(start * (1 - i / 40))
@@ -1061,13 +1115,21 @@ local function paintCar(e, color, material)
     local prompt = booth:FindFirstChild("Prompt")
     local pp = prompt and prompt:FindFirstChildWhichIsA("ProximityPrompt")
     if pp then tpTo(prompt.CFrame * CFrame.new(0, 0, -3)); task.wait(0.3); fireproximityprompt(pp); task.wait(0.6) end
-    local before = car.Values.PaintColor.Value
-    Events.Vehicles.SetPaint:FireServer("Car", car, color, material)
+    -- read off the current instance: the one spawnCar handed back can be swapped by now
+    local function paintNow()
+        local c = carOf(e)
+        local v = c and c:FindFirstChild("Values")
+        v = v and v:FindFirstChild("PaintColor")
+        return v and v.Value
+    end
+    local before = paintNow()
+    Events.Vehicles.SetPaint:FireServer("Car", carOf(e) or car, color, material)
     local t = os.clock()
-    repeat task.wait(0.1) until car.Values.PaintColor.Value ~= before or os.clock() - t > 3
+    repeat task.wait(0.1) until paintNow() ~= before or os.clock() - t > 3
     local fr = LP.PlayerGui:FindFirstChild("HUD") and LP.PlayerGui.HUD.Frames:FindFirstChild("Paint")
     if fr and fr.Visible then fr.Visible = false end
-    local ok = car.Values.PaintColor.Value ~= before
+    local after = paintNow()
+    local ok = before ~= nil and after ~= nil and after ~= before
     restore()
     return ok, ok and ("painted %s %s for %s"):format(entryModel(e), material, money(price)) or "paint didn't take"
 end
