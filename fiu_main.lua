@@ -176,7 +176,20 @@ local STATE = readJSON(DIR .. "/state.json", {})
 HOOK.ownedFile = ("%s/owned_%d.json"):format(DIR, LP.UserId)
 HOOK.favFile = ("%s/favorites_%d.json"):format(DIR, LP.UserId)
 HOOK.pendFile = ("%s/pending_buys_%d.json"):format(DIR, LP.UserId)
+HOOK.ownedBak = ("%s/owned_%d.bak.json"):format(DIR, LP.UserId)
+-- server time: BoughtAt is stamped by the server, and a PC clock can be off (the owner's ran 13.6 s ahead, which made
+-- every pending-buy match miss its -10 s window: lost flip tags were never restored)
+function HOOK.now()
+    local ok, t = pcall(function() return workspace:GetServerTimeNow() end)
+    return ok and t > 0 and math.floor(t) or os.time()
+end
 local OWNED = readJSON(HOOK.ownedFile, nil) -- [garage GUID] = { model, boughtAt } — the ONLY sellable cars
+if not OWNED and select(2, pcall(isfile, HOOK.ownedFile)) == true then
+    -- the file is there but unreadable (cut short by a crash mid-write): take the backup, never the stale pre-2026-10-08
+    -- shared owned.json (that put old tags over the real ones); with no backup the purchase history re-tags the cars
+    OWNED = readJSON(HOOK.ownedBak, nil) or {}
+    lifeLog("owned file unreadable: " .. (next(OWNED) and "restored from the backup" or "starting empty, the purchase history re-tags the cars"))
+end
 local FAV = readJSON(HOOK.favFile, nil) -- [garage GUID] = model name — locked by the player
 if not OWNED or not FAV then
     local t = os.clock()
@@ -190,7 +203,7 @@ if not OWNED or not FAV then
     if not FAV then FAV = mine(readJSON(DIR .. "/favorites.json", {})); writeJSON(HOOK.favFile, FAV) end
 end
 if STATE.sellCooldown then CFG.sellCooldown = STATE.sellCooldown end
-local function saveOwned() writeJSON(HOOK.ownedFile, OWNED) end
+local function saveOwned() writeJSON(HOOK.ownedFile, OWNED); writeJSON(HOOK.ownedBak, OWNED) end -- a crash cuts one write, not both
 local function saveFav() writeJSON(HOOK.favFile, FAV) end
 local function saveState() STATE.sellCooldown = CFG.sellCooldown; writeJSON(DIR .. "/state.json", STATE) end
 
@@ -551,22 +564,31 @@ local function maybeAutoLock(e)
 end
 local function isFlip(e) return OWNED[e.Name] ~= nil and not isFav(e) end
 
--- Flip tags a crash or disconnect lost. (1) A buy is written to pending_buys_<id>.json the moment it's confirmed, and
--- dropped once the car is tagged; a pending buy still there later (crash in the seconds before the car showed up)
--- tags the untracked car whose server-side BoughtAt matches it. (2) A tag whose garage id is gone moves to an untracked
--- car of the same model bought at the same time. Matching on BoughtAt means a car you bought yourself is never tagged.
+-- Flip tags a crash, a slow server or a damaged file lost. pending_buys_<id>.json is the purchase history: a buy is
+-- written the moment it's confirmed (server time), gets the car's garage id + BoughtAt once it shows up, and stays until
+-- the car is sold or its tag is removed by hand. HOOK.reconcile (at load, then every 30 s) re-tags any car in it that
+-- has no tag: by garage id, else by exact BoughtAt + model (the id changed), else, for a buy whose car never showed up
+-- in time, by a window around the buy. A tag whose garage id is gone also moves to an untracked car of the same model
+-- bought at the same time. Matching on the script's own buys means a car you bought yourself is never tagged.
+-- (Until 2026-10-15 the entry was dropped right after tagging and matched against the PC clock: a later loss, or a PC
+-- clock over 10 s fast, and the tag was gone for good.)
 function HOOK.pendAdd(model, price)
     local t = readJSON(HOOK.pendFile, {})
-    local at = os.time()
+    local at = HOOK.now()
     t[#t + 1] = { model = model, price = price, at = at }
     writeJSON(HOOK.pendFile, t)
     return at
 end
-function HOOK.pendDrop(at)
+function HOOK.pendTag(at, guid, boughtAt) -- the bought car showed up: remember exactly which one it is
     if not at then return end
+    local t = readJSON(HOOK.pendFile, {})
+    for _, pb in ipairs(t) do if pb.at == at and not pb.guid then pb.guid, pb.boughtAt = guid, boughtAt break end end
+    writeJSON(HOOK.pendFile, t)
+end
+function HOOK.pendForget(guid) -- sold, or its flip tag removed by hand: never re-tag it
     local t, keep = readJSON(HOOK.pendFile, {}), {}
-    for _, pb in ipairs(t) do if pb.at ~= at then keep[#keep + 1] = pb end end
-    writeJSON(HOOK.pendFile, keep)
+    for _, pb in ipairs(t) do if pb.guid ~= guid then keep[#keep + 1] = pb end end
+    if #keep ~= #t then writeJSON(HOOK.pendFile, keep) end
 end
 function HOOK.reconcile()
     local kids = Garage:GetChildren()
@@ -594,26 +616,55 @@ function HOOK.reconcile()
             end
         end
     end
-    local pend, keep = readJSON(HOOK.pendFile, {}), {}
-    for _, pb in ipairs(pend) do
-        local inWin = function(e)
-            local b = tonumber(entryVal(e, "BoughtAt"))
-            return b ~= nil and b >= (pb.at or 0) - 10 and b <= (pb.at or 0) + 120
-        end
-        local hits = take(function(e) return inWin(e) and entryModel(e) == pb.model end)
-        if #hits == 0 then -- the junk name may not match the garage's model name: take the time match if it's the only one
-            local any = take(inWin)
-            if #any == 1 then hits = any end
-        end
-        if #hits >= 1 then
-            local e = table.remove(untracked, hits[1])
-            OWNED[e.Name] = { model = entryModel(e), boughtAt = tonumber(entryVal(e, "BoughtAt")) or pb.at, price = pb.price, recovered = true }
-            fixed += 1; log("flip tag restored: " .. entryModel(e) .. " (bought before a crash/disconnect)")
-        elseif os.time() - (pb.at or 0) < 86400 then
-            keep[#keep + 1] = pb
+    local pend, keep, dirty = readJSON(HOOK.pendFile, {}), {}, false
+    -- flip cars from before the history kept entries (or a lost history file): put them in it, so they're covered too
+    local listed = {}
+    for _, pb in ipairs(pend) do if pb.guid then listed[pb.guid] = true end end
+    for guid, o in pairs(OWNED) do
+        if present[guid] and not listed[guid] then
+            local e = Garage:FindFirstChild(guid)
+            pend[#pend + 1] = { model = o.model, price = o.price, at = o.boughtAt or HOOK.now(), guid = guid, boughtAt = tonumber(entryVal(e, "BoughtAt")) or o.boughtAt }
+            dirty = true
         end
     end
-    if #keep ~= #pend then writeJSON(HOOK.pendFile, keep) end
+    local now = HOOK.now()
+    for _, pb in ipairs(pend) do
+        local e
+        if pb.guid and present[pb.guid] then
+            e = Garage:FindFirstChild(pb.guid)
+        elseif pb.boughtAt then -- its garage id changed: same model, same server BoughtAt
+            local hits = take(function(x)
+                local b = tonumber(entryVal(x, "BoughtAt"))
+                return b ~= nil and entryModel(x) == pb.model and math.abs(b - pb.boughtAt) <= 2
+            end)
+            if #hits >= 1 then e = untracked[hits[1]] end
+        else -- the car never showed up in time (crash, slow server): BoughtAt near the buy, in server time
+            local inWin = function(x)
+                local b = tonumber(entryVal(x, "BoughtAt"))
+                return b ~= nil and b >= (pb.at or 0) - 60 and b <= (pb.at or 0) + 180
+            end
+            local hits = take(function(x) return inWin(x) and entryModel(x) == pb.model end)
+            if #hits == 0 then -- the junk name may not match the garage's model name: take the time match if it's the only one
+                local any = take(inWin)
+                if #any == 1 then hits = any end
+            end
+            if #hits >= 1 then e = untracked[hits[1]] end
+        end
+        if e then
+            if not OWNED[e.Name] and not FAV[e.Name] then
+                OWNED[e.Name] = { model = entryModel(e), boughtAt = tonumber(entryVal(e, "BoughtAt")) or pb.at, price = pb.price, recovered = true }
+                fixed += 1; log("flip tag restored: " .. entryModel(e)); lifeLog("flip tag restored: " .. entryModel(e))
+            end
+            for i, x in ipairs(untracked) do if x == e then table.remove(untracked, i) break end end
+            if pb.guid ~= e.Name or not pb.boughtAt then pb.guid, pb.boughtAt = e.Name, tonumber(entryVal(e, "BoughtAt")); dirty = true end
+            keep[#keep + 1] = pb
+        elseif now - (pb.at or 0) < 3 * 86400 then
+            keep[#keep + 1] = pb -- not matched yet (garage still loading, or sold outside the script: dropped after 3 days)
+        else
+            dirty = true
+        end
+    end
+    if dirty or #keep ~= #pend then writeJSON(HOOK.pendFile, keep) end
     if fixed > 0 then saveOwned() end
     return fixed
 end
@@ -707,7 +758,7 @@ end
 local function sellCooldownLeft(e)
     if CFG.sellCooldown <= 0 then return 0 end
     local bought = tonumber(entryVal(e, "BoughtAt")) or 0
-    return math.max(0, bought + CFG.sellCooldown - os.time())
+    return math.max(0, bought + CFG.sellCooldown - HOOK.now()) -- BoughtAt is server time
 end
 
 -- ============================== machines ==============================
@@ -1292,7 +1343,7 @@ local function sellCar(e, manual)
         repeat task.wait(0.1); gone = e.Parent == nil until gone or os.clock() - t > 4
         if gone then
             confirmFn = nil
-            OWNED[e.Name] = nil; saveOwned()
+            OWNED[e.Name] = nil; saveOwned(); pcall(HOOK.pendForget, e.Name)
             -- "earned" was always revenue (sale prices); profit = sale - buy price - parts bought for it, tracked from now on
             STATE.sold = (STATE.sold or 0) + 1; STATE.earned = (STATE.earned or 0) + (offer or 0)
             if offer and cost > 0 then
@@ -1309,7 +1360,7 @@ local function sellCar(e, manual)
             if secs then
                 -- learn the timer: now - BoughtAt + remaining
                 local bought = tonumber(entryVal(e, "BoughtAt")) or os.time()
-                CFG.sellCooldown = math.max(CFG.sellCooldown, os.time() - bought + secs)
+                CFG.sellCooldown = math.max(CFG.sellCooldown, HOOK.now() - bought + secs)
                 saveState()
                 log(("learned sell timer: %d s"):format(CFG.sellCooldown))
                 break
@@ -1394,7 +1445,7 @@ local function buyJunk(info, opts)
         repeat
             task.wait(0.1)
             for _, g in ipairs(entries()) do if not before[g] then new = g end end
-        until new or os.clock() - t > 5
+        until new or os.clock() - t > 15 -- a busy server can take several seconds; a miss is re-tagged from the history
     end
     confirmFn = nil
     if opts.quote then
@@ -1402,10 +1453,10 @@ local function buyJunk(info, opts)
         return nil, nil, asked and "no price in the offer" or "the server never offered the car (someone else bought it, or you're too far)"
     end
     if new then
-        OWNED[new.Name] = { model = entryModel(new), boughtAt = tonumber(entryVal(new, "BoughtAt")) or os.time(), price = price }
+        OWNED[new.Name] = { model = entryModel(new), boughtAt = tonumber(entryVal(new, "BoughtAt")) or HOOK.now(), price = price }
         if maybeAutoLock(new) then notify(("Auto-locked %s: rare, it will not be sold"):format(entryModel(new))) end
         saveOwned()
-        HOOK.pendDrop(pendAt)
+        HOOK.pendTag(pendAt, new.Name, OWNED[new.Name].boughtAt)
         return new, ("bought %s for %s%s"):format(entryModel(new), money(price), sniped and " · sniped from a player at it" or "")
     end
     if not asked then return nil, "the server never offered the car (someone else bought it, or you're too far)" end
@@ -3663,7 +3714,10 @@ FavBox:AddButton({ Text = "Tag selected car as flip", Tooltip = "Auto flip will 
     saveOwned(); log("tagged as flip: " .. entryModel(selectedCar))
 end })
 FavBox:AddButton({ Text = "Remove flip tag", DoubleClick = true, Tooltip = "Double-click. Auto flip stops touching it (it is not locked).", Func = function()
-    if selectedCar and OWNED[selectedCar.Name] then OWNED[selectedCar.Name] = nil; saveOwned(); log("flip tag removed: " .. entryModel(selectedCar)) end
+    if selectedCar and OWNED[selectedCar.Name] then
+        OWNED[selectedCar.Name] = nil; saveOwned(); HOOK.pendForget(selectedCar.Name) -- or the history would re-tag it in 30 s
+        log("flip tag removed: " .. entryModel(selectedCar))
+    end
 end })
 FavBox:AddToggle("FIU_AutoLock", { Text = "Auto lock tier", Default = CFG.autoLock,
     Tooltip = "Any car you get at this tier or rarer (or the models below), bought by the script or by you, is locked right away and never sold",

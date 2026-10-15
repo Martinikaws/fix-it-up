@@ -37,7 +37,8 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 |---|---|
 | `owned_<UserId>.json` | flip-tagged cars (the **only** cars auto sell sells), migrated from the old shared `owned.json` |
 | `favorites_<UserId>.json` | locked cars: never sold, never touched by auto |
-| `pending_buys_<UserId>.json` | buys written the moment they are confirmed, used to re-tag a car after a crash (matched on the server's `BoughtAt`) |
+| `owned_<UserId>.bak.json` | second copy of the flip tags, written on every save; loaded if the main file is unreadable (never the stale shared `owned.json`) |
+| `pending_buys_<UserId>.json` | **purchase history**. Each buy is written at confirm in server time (`HOOK.now()`), gets its garage id and `BoughtAt` once it shows up, and stays until sold or untagged by hand. `HOOK.reconcile` re-tags any car in it that lost its tag: by id, else by exact `BoughtAt` + model, else by a −60/+180 s server-time window. Until 2026-10-15 it was matched against the PC clock (the owner's ran 13.6 s fast, which broke every match) and dropped at tag time. |
 | `../fiu_hop_<UserId>.json` | server-hop settings and visited servers (workspace root, not `FixItUp/`) |
 | `webhook.json` | Discord webhook URL and settings (shared, kept out of SaveManager configs) |
 | `accounts/<UserId>.json`, `accounts_last.json` | multi-account heartbeat (every 20 s) and the last grouped money report |
