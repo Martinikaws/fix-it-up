@@ -21,9 +21,10 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
      for o in -O0 -O1 -O2; do for g in -g0 -g1 -g2; do luau-compile --null $o $g fiu_main.lua; done; done
      ```
      Get `luau-compile` from https://github.com/luau-lang/luau/releases. Big blocks such as the Drive tab hit the same limit on their own, so keep checking there too.
-2. **Multiple accounts share one executor workspace.** Any state that belongs to one account must go in a file named with its `LP.UserId`. A shared file lets one account overwrite another's data; this caused real bugs, now fixed.
-3. **No in-game test from the cloud.** Code was written against the measured mechanics below. Anything marked *untested* needs an in-game check.
-4. **Commits:** small, with a message explaining *why*. The author is `Martinikaws`.
+2. **Never hold a car instance across a wait.** A respawn, or the car streaming out while you're at the store, swaps the instance in `workspace.Vehicles`, and the old one loses its children: indexing it throws "Values / Body is not a valid member of Model". Read the car through `HOOK.carNow(e, timeout)` (the current instance once `Values.Engine.Wear` exist) or `carOf(e)` at each step, and use `FindFirstChild` on anything under it.
+3. **Multiple accounts share one executor workspace.** Any state that belongs to one account must go in a file named with its `LP.UserId`. A shared file lets one account overwrite another's data; this caused real bugs, now fixed.
+4. **No in-game test from the cloud.** Code was written against the measured mechanics below. Anything marked *untested* needs an in-game check.
+5. **Commits:** small, with a message explaining *why*. The author is `Martinikaws`.
 
 ## Files in the executor workspace (`FixItUp/`)
 
@@ -35,7 +36,7 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
 | `../fiu_hop_<UserId>.json` | server-hop settings and visited servers (workspace root, not `FixItUp/`) |
 | `webhook.json` | Discord webhook URL and settings (shared, kept out of SaveManager configs) |
 | `accounts/<UserId>.json`, `accounts_last.json` | multi-account heartbeat (every 20 s) and the last grouped money report |
-| `menukey.json` | open/close menu key and 3D-rendering key |
+| `menukey.json` | open/close menu key (`key`), 3D-rendering key (`render`), stats screen key (`stats`) |
 | `state.json` | sell cooldown, auction stats, auction sell queue (`STATE.auction.sell`) |
 | `drive.json` | km per car, Drive tab car pick, auto-tune results |
 | `life.log`, `errors.txt` | lifecycle log (hops, anti-mod, auctions) and errors caught by `guard()` |
@@ -81,6 +82,14 @@ Pushing to `main` updates every user. GitHub's raw link can take a few minutes t
   - **auto sell of won junk cars, washed first**, with a queue that survives crashes;
   - this-run and all-time stats.
 - **Candy tab:** collects all 12 jars, nearest first, clicking each once and rechecking every 5 min. *Untested: refill time unknown.*
+
+## Added 2026-10-15 (local Claude Code session)
+
+- **Rebrand:** Martini Hub, Emerald theme, logo (see the top of this file).
+- **Auto repair crash fix:** `repairCar` is a pcall wrapper over `HOOK.repairRaw`. A throw counts as one failed try (before, it skipped autoStep's try counter and the same car was retried every 2 s forever), disconnects the parts pin (`HOOK.repairPin`) and reinstalls the pulled parts (`HOOK.repairParts`).
+- **Auto rejoin** (Server hop tab, `HOP.rejoin`, on by default): `STAFF.rejoin` runs on `GuiService.ErrorMessageChanged` and CoreGui's `ErrorPrompt`. It acts only on a real disconnect (a 2xx code, or no `ClientReplicator`), never after the anti-mod kick (`STAFF.gone`) or on error 273. It queues `RELOAD`, then calls `TeleportService:Teleport(PlaceId)` with retries. *Untested in game.*
+- **Stuck watchdog** (Auto tab, `CFG.wdOn/wdMins/wdHop`): the auto loop is `HOOK.autoLoop(gen)`, and `HOOK.WD` tracks the step start and the error streak. A step running past the limit, or 10+ errors over 3 min, fires `HOOK.wdFire`: cancel the run, reinstall pulled parts, clear `busy`, reset the character, restart. A second hang within 30 min hops via `STAFF.hopOnce`. Error loops never hop and stop after 3 resets. *Untested in game.*
+- **Stats screen** (Settings > Menu, key F6 by default): `HOOK.statsShow(on)` builds a full-screen ScreenGui (DisplayOrder 900, under Obsidian's 998) in the theme's MainColor with 9 stat cards, and turns 3D rendering off. It reads `HOOK.farm` and `HOOK.candy`, published from their tabs. *Untested in game.*
 
 ## Open items / verify in game
 
